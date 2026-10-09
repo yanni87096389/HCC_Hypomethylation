@@ -1,0 +1,809 @@
+---
+title: "Step 3: Background Filtering in Other Normal Tissues"
+author: "YC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    fig_width: 7
+    fig_height: 7
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE)
+```
+
+# Analysis overview
+
+This workflow contains two main stages:
+
+1. Preprocess two independent normal-tissue methylation datasets and save the ChAMP-filtered objects as `.Rdata` files.
+2. Use these datasets to remove robust hypo-DMRs that are also hypomethylated in normal/background tissues.
+
+The background-filtering criterion is:
+
+- at least 6 available CpG probes in each background dataset;
+- the minimum tissue-group mean beta value must be above 0.20 in every background dataset.
+
+## 🍁🍁 step0.data preprocessing
+
+For each normal-tissue dataset, we:
+
+1. Standardized the beta-value matrix and sample IDs.
+2. Constructed the tissue phenotype table and aligned it with the beta matrix. As all samples were normal tissues, no Normal/Tumor grouping was required.
+3. Applied `champ.filter()` for probe filtering and saved the filtered beta matrix and phenotype table as a `myLoad` object in `.Rdata` format.
+
+## 🍁🍁Step 1: Background filtering in other normal tissues
+
+In this step, we:
+
+1. Loaded the robust validated hypo-DMRs and standardized their genomic coordinates.
+2.Loaded the ChAMP-filtered normal-tissue datasets and aligned each beta matrix with its phenotype table.
+3.Identified the CpG probes located within each DMR using the corresponding EPIC or 450K annotation.
+4.Calculated the regional beta value for each sample and the mean beta value for each tissue group.
+5. Retained DMRs with at least six available CpGs and a minimum tissue-group mean beta value above 0.20 in every background dataset.
+6.Saved and checked the detailed summaries and final background-filtered DMR list.
+
+#### Load background-filtering packages
+
+```{r load-background-filtering-packages}
+
+rm(list = ls())
+
+library(data.table)
+library(GenomicRanges)
+library(IRanges)
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+```
+
+#### Define filtering parameters and input files
+
+```{r define-background-filtering-settings}
+## A hypo-DMR passes only when all background tissue-group means are above 0.20.
+beta_threshold <- 0.20
+
+## The original discovery criterion was no.cpgs > 5, which is equivalent
+## to requiring at least 6 available CpG probes.
+min_bg_cpg <- 6L
+
+robust_dmr_file <- "robust_validated_hypo_DMRs_at_least_3datasets.csv"
+
+```
+
+#### Define the output directory for all Step 3 results
+```{r}
+
+outdir <- "step3.background filtering in other normal tissues hypo"
+
+## Create the directory if it does not already exist
+if (!dir.exists(outdir)) {
+  dir.create(
+    outdir,
+    recursive = TRUE
+  )
+}
+```
+
+## Define chromosome standardization helper
+
+```{r define-chromosome-helper}
+standardize_chr <- function(x) {
+  x <- as.character(x)
+  out <- rep(NA_character_, length(x))
+
+  keep <- !is.na(x) & nzchar(trimws(x))
+  x_clean <- trimws(x[keep])
+  x_clean <- gsub("^chr", "", x_clean, ignore.case = TRUE)
+
+  x_clean[x_clean == "23"] <- "X"
+  x_clean[x_clean == "24"] <- "Y"
+  x_clean[x_clean %in% c("M", "MT")] <- "M"
+
+  out[keep] <- paste0("chr", x_clean)
+  out
+}
+```
+
+## Read and standardize robust DMRs
+
+```{r read-robust-dmrs}
+dmrs <- fread(robust_dmr_file,data.table = FALSE)
+
+stopifnot(all(c("chr", "start", "end") %in% colnames(dmrs)))
+
+## Preserve an existing DMR identifier whenever possible
+dmrs$DMR_ID <- as.character(dmrs$DMR_id)
+
+stopifnot(!anyNA(dmrs$DMR_ID),
+  !anyDuplicated(dmrs$DMR_ID))
+## Preserve the discovery delta beta when available
+## Read the original discovery DMR results
+discovery_dmrs <- fread("dmr_hypo_dmrcate_meta.csv",data.table = FALSE)
+## Check the available columns
+names(discovery_dmrs)
+stopifnot(all(dmrs$DMR_id %in% discovery_dmrs$coord))
+## Match validated DMRs to the original discovery results
+match_index_discovery <- match(dmrs$DMR_id,discovery_dmrs$coord)
+stopifnot(!anyNA(match_index_discovery))
+dmrs$discovery_deltaBeta <- as.numeric(discovery_dmrs$meandiff[match_index_discovery])
+
+stopifnot(!anyNA(dmrs$discovery_deltaBeta))
+
+head(dmrs[, c("DMR_id",
+    "mean_deltaBeta",
+    "discovery_deltaBeta")])
+```
+
+## Clean DMR coordinates and construct genomic ranges
+
+```{r build-dmr-genomic-ranges}
+dmrs$DMR_ID <- as.character(dmrs$DMR_ID)
+dmrs$chr <- standardize_chr(dmrs$chr)
+dmrs$start <- as.integer(dmrs$start)
+dmrs$end <- as.integer(dmrs$end)
+
+## Retain complete, valid autosomal intervals
+keep_dmr <-
+  !is.na(dmrs$DMR_ID) &
+  !is.na(dmrs$chr) &
+  !is.na(dmrs$start) &
+  !is.na(dmrs$end) &
+  dmrs$start <= dmrs$end &
+  dmrs$chr %in% paste0("chr", 1:22)
+
+dmrs <- dmrs[keep_dmr, , drop = FALSE]
+rownames(dmrs) <- NULL
+
+stopifnot(nrow(dmrs) > 0,!anyDuplicated(dmrs$DMR_ID))
+
+dmr_gr <- GRanges(
+  seqnames = dmrs$chr,
+  ranges = IRanges(
+    start = dmrs$start,
+    end = dmrs$end
+  ),
+  DMR_ID = dmrs$DMR_ID
+)
+
+dim(dmrs)
+print(head(dmrs[, c("DMR_ID", "chr", "start", "end")]))
+```
+
+# Helper functions
+
+## Safely load a ChAMP object from an `.Rdata` file
+
+```{r define-load-myload-function}
+load_myLoad_Rdata <- function(file) {
+  if (!file.exists(file)) {
+    stop(paste0("File does not exist: ", file))
+  }
+
+  tmp_env <- new.env()
+  loaded_objects <- load(file, envir = tmp_env)
+
+  if (!"myLoad" %in% loaded_objects) {
+    stop(paste0(
+      "Object 'myLoad' was not found in ",
+      file,
+      ". Objects found: ",
+      paste(loaded_objects, collapse = ", ")
+    ))
+  }
+
+  myLoad <- get("myLoad", envir = tmp_env)
+
+  if (!is.list(myLoad) || !all(c("beta", "pd") %in% names(myLoad))) {
+    stop(paste0(
+      "The myLoad object in ",
+      file,
+      " must be a list containing beta and pd."
+    ))
+  }
+
+  myLoad
+}
+```
+
+## Align a ChAMP beta matrix and phenotype table
+
+```{r define-align-background-data-function}
+align_background_data <- function(myLoad, dataset_name) {
+  beta <- as.matrix(myLoad$beta)
+  storage.mode(beta) <- "double"
+
+  pd <- as.data.frame(myLoad$pd)
+
+  if (
+    "ID" %in% colnames(pd) &&
+    setequal(as.character(pd$ID), colnames(beta))
+  ) {
+    rownames(pd) <- as.character(pd$ID)
+  }
+
+  if (!setequal(rownames(pd), colnames(beta))) {
+    stop(paste0(
+      "Sample names in beta and pd do not match for ",
+      dataset_name,
+      "."
+    ))
+  }
+
+  pd <- pd[colnames(beta), , drop = FALSE]
+
+  if (!"group" %in% colnames(pd)) {
+    stop(paste0(
+      "The phenotype table for ",
+      dataset_name,
+      " does not contain a group column."
+    ))
+  }
+
+  pd$group <- as.character(pd$group)
+
+  stopifnot(
+    identical(colnames(beta), rownames(pd))
+  )
+
+  list(beta = beta, pd = pd)
+}
+```
+
+## Select normal/background samples
+
+```{r define-select-background-samples-function}
+select_background_samples <- function(beta, pd, dataset_name) {
+
+  ## Retain samples with valid tissue-group information
+  keep <- !is.na(pd$group)
+
+  ## If sample type is available, retain normal samples only
+  if ("sample_type" %in% colnames(pd)) {
+    keep <- keep & pd$sample_type == "Normal"
+  }
+
+  keep[is.na(keep)] <- FALSE
+
+  if (!any(keep)) {
+    stop(paste0(
+      "No normal/background samples remained in ",
+      dataset_name,
+      "."
+    ))
+  }
+
+  beta <- beta[, keep, drop = FALSE]
+  pd <- pd[keep, , drop = FALSE]
+
+  stopifnot(
+    identical(colnames(beta), rownames(pd))
+  )
+
+  list(
+    beta = beta,
+    pd = pd
+  )
+}
+```
+
+## Load the appropriate hg19 array annotation
+
+```{r define-array-annotation-function}
+get_array_annotation <- function(arraytype) {
+  arraytype <- toupper(arraytype)
+
+  if (arraytype == "450K") {
+    anno <- minfi::getAnnotation(
+      IlluminaHumanMethylation450kanno.ilmn12.hg19
+    )
+  } else if (arraytype == "EPIC") {
+    anno <- minfi::getAnnotation(
+      IlluminaHumanMethylationEPICanno.ilm10b4.hg19
+    )
+  } else {
+    stop("arraytype must be either '450K' or 'EPIC'.")
+  }
+
+  anno <- as.data.frame(anno)
+
+  anno$CpG <- rownames(anno)
+  anno$chr <- standardize_chr(anno$chr)
+  anno$pos <- as.integer(anno$pos)
+
+  keep <-
+    !is.na(anno$CpG) &
+    !is.na(anno$chr) &
+    !is.na(anno$pos) &
+    anno$chr %in% paste0("chr", 1:22)
+
+  anno <- anno[keep, c("CpG", "chr", "pos"), drop = FALSE]
+  rownames(anno) <- NULL
+
+  anno
+}
+```
+
+## Map DMR intervals to CpGs available in one dataset
+
+```{r define-map-dmrs-to-cpgs-function}
+map_dmrs_to_available_cpgs <- function(beta, arraytype, dmr_gr) {
+  anno <- get_array_annotation(arraytype)
+
+  common_cpgs <- intersect(rownames(beta), anno$CpG)
+
+  if (length(common_cpgs) == 0) {
+    stop("No CpG probes overlapped between the beta matrix and annotation.")
+  }
+
+  beta <- beta[common_cpgs, , drop = FALSE]
+  anno <- anno[match(common_cpgs, anno$CpG), , drop = FALSE]
+
+  stopifnot(
+    identical(rownames(beta), anno$CpG)
+  )
+
+  cpg_gr <- GRanges(
+    seqnames = anno$chr,
+    ranges = IRanges(
+      start = anno$pos,
+      end = anno$pos
+    ),
+    CpG = anno$CpG
+  )
+
+  hits <- findOverlaps(dmr_gr, cpg_gr)
+
+  dmr_cpg_list <- split(
+    mcols(cpg_gr)$CpG[subjectHits(hits)],
+    as.character(queryHits(hits))
+  )
+
+  list(
+    beta = beta,
+    annotation = anno,
+    dmr_cpg_list = dmr_cpg_list
+  )
+}
+```
+
+## Define safe summary functions
+
+```{r define-safe-summary-functions}
+safe_mean <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    NA_real_
+  } else {
+    mean(x, na.rm = TRUE)
+  }
+}
+
+safe_max <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    NA_real_
+  } else {
+    max(x, na.rm = TRUE)
+  }
+}
+
+safe_min <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    NA_real_
+  } else {
+    min(x, na.rm = TRUE)
+  }
+}
+```
+
+## Create a result row for a DMR with no available CpGs
+
+```{r define-empty-background-result-function}
+empty_background_result <- function(dmr_row, dataset_name) {
+  list(
+    dataset_summary = data.frame(
+  DMR_ID = dmr_row$DMR_ID,
+  chr = dmr_row$chr,
+  start = dmr_row$start,
+  end = dmr_row$end,
+  dataset = dataset_name,
+  nCpG_background = 0L,
+  mean_beta_all_background = NA_real_,
+  max_sample_beta = NA_real_,
+  min_group_mean_beta = NA_real_,
+  background_pass = FALSE,
+  stringsAsFactors = FALSE
+),
+    tissue_mean_df = NULL
+  )
+}
+```
+
+## Summarize one DMR in one background dataset
+
+```{r define-summarize-one-background-dmr-function}
+summarize_one_background_dmr <- function(
+    i,
+    dmrs,
+    dmr_cpg_list,
+    beta,
+    pd,
+    dataset_name,
+    min_bg_cpg,
+    beta_threshold) {
+
+  dmr_row <- dmrs[i, , drop = FALSE]
+  cpgs <- dmr_cpg_list[[as.character(i)]]
+
+  if (is.null(cpgs)) {
+    return(empty_background_result(dmr_row, dataset_name))
+  }
+
+  cpgs <- unique(intersect(cpgs, rownames(beta)))
+
+  if (length(cpgs) == 0) {
+    return(empty_background_result(dmr_row, dataset_name))
+  }
+
+  ## Calculate one regional beta value per sample
+  dmr_value <- colMeans(
+    beta[cpgs, , drop = FALSE],
+    na.rm = TRUE
+  )
+  dmr_value[is.nan(dmr_value)] <- NA_real_
+
+  ## Calculate the mean regional beta value within each tissue group
+  group_mean <- tapply(
+    dmr_value,
+    pd$group,
+    safe_mean
+  )
+
+  tissue_mean_df <- data.frame(
+    DMR_ID = dmr_row$DMR_ID,
+    chr = dmr_row$chr,
+    start = dmr_row$start,
+    end = dmr_row$end,
+    dataset = dataset_name,
+    group = names(group_mean),
+    mean_beta = as.numeric(group_mean),
+    stringsAsFactors = FALSE
+  )
+
+  ## A hypo-DMR passes when it has sufficient CpG coverage and
+## every normal tissue-group mean beta is above the predefined threshold.
+min_group_mean_beta <- safe_min(group_mean)
+
+background_pass <-
+  length(cpgs) >= min_bg_cpg &&
+  !is.na(min_group_mean_beta) &&
+  min_group_mean_beta > beta_threshold
+
+  dataset_summary <- data.frame(
+  DMR_ID = dmr_row$DMR_ID,
+  chr = dmr_row$chr,
+  start = dmr_row$start,
+  end = dmr_row$end,
+  dataset = dataset_name,
+  nCpG_background = length(cpgs),
+  mean_beta_all_background = safe_mean(dmr_value),
+  max_sample_beta = safe_max(dmr_value),
+  min_group_mean_beta = min_group_mean_beta,
+  background_pass = background_pass,
+  stringsAsFactors = FALSE
+)
+
+  list(
+    dataset_summary = dataset_summary,
+    tissue_mean_df = tissue_mean_df
+  )
+}
+```
+
+## Background-filter one dataset
+
+```{r define-background-filter-one-dataset-function}
+background_filter_one_dataset <- function(
+    dataset_name,
+    rdata_file,
+    arraytype,
+    dmrs,
+    dmr_gr,
+    min_bg_cpg,
+    beta_threshold) {
+
+  cat("\n", strrep("=", 60), "\n", sep = "")
+  cat("Background filtering dataset:", dataset_name, "\n")
+  cat(strrep("=", 60), "\n", sep = "")
+
+  ## Load and align the ChAMP-filtered data
+  myLoad <- load_myLoad_Rdata(rdata_file)
+  aligned <- align_background_data(myLoad, dataset_name)
+
+  ## Retain the normal/background samples
+  selected <- select_background_samples(
+    aligned$beta,
+    aligned$pd,
+    dataset_name
+  )
+
+  beta_bg <- selected$beta
+  pd_bg <- selected$pd
+
+  cat("Background sample distribution:\n")
+  print(table(pd_bg$group, useNA = "ifany"))
+
+  ## Map the DMR intervals to probes available on this array
+  mapped <- map_dmrs_to_available_cpgs(
+    beta = beta_bg,
+    arraytype = arraytype,
+    dmr_gr = dmr_gr
+  )
+
+  beta_bg <- mapped$beta
+  dmr_cpg_list <- mapped$dmr_cpg_list
+
+  ## Summarize every DMR
+  dmr_results <- lapply(
+    seq_len(nrow(dmrs)),
+    summarize_one_background_dmr,
+    dmrs = dmrs,
+    dmr_cpg_list = dmr_cpg_list,
+    beta = beta_bg,
+    pd = pd_bg,
+    dataset_name = dataset_name,
+    min_bg_cpg = min_bg_cpg,
+    beta_threshold = beta_threshold
+  )
+
+  dataset_summary <- rbindlist(
+    lapply(dmr_results, `[[`, "dataset_summary"),
+    fill = TRUE
+  )
+
+  tissue_results <- lapply(
+    dmr_results,
+    `[[`,
+    "tissue_mean_df"
+  )
+  tissue_results <- Filter(Negate(is.null), tissue_results)
+
+  if (length(tissue_results) == 0) {
+    tissue_mean_df <- data.table()
+  } else {
+    tissue_mean_df <- rbindlist(
+      tissue_results,
+      fill = TRUE
+    )
+  }
+
+  stopifnot(
+    nrow(dataset_summary) == nrow(dmrs)
+  )
+
+  list(
+    dataset_summary = dataset_summary,
+    tissue_mean_df = tissue_mean_df
+  )
+}
+```
+
+# Run background filtering
+
+## Define the background datasets
+
+```{r define-background-datasets}
+background_files <- data.frame(
+  
+  dataset = c("GSE213478","GSE48472"),
+  
+  file = c("step0.1-GSE213478_output.Rdata","step0.2-GSE48472_output.Rdata"),
+  
+  arraytype = c("EPIC","450K"),
+  
+  stringsAsFactors = FALSE
+)
+
+background_files$file_exists <- file.exists(background_files$file)
+
+if (!all(background_files$file_exists)) {
+  stop(
+    "Some background .Rdata files do not exist. Check background_files."
+  )
+}
+```
+
+## Apply the filter to every background dataset
+
+```{r run-background-filtering}
+background_outputs <- lapply(
+  seq_len(nrow(background_files)),
+  function(i) {
+    background_filter_one_dataset(
+      dataset_name = background_files$dataset[i],
+      rdata_file = background_files$file[i],
+      arraytype = background_files$arraytype[i],
+      dmrs = dmrs,
+      dmr_gr = dmr_gr,
+      min_bg_cpg = min_bg_cpg,
+      beta_threshold = beta_threshold
+    )
+  }
+)
+
+names(background_outputs) <- background_files$dataset
+```
+
+## Combine the dataset-level results
+
+```{r combine-background-results}
+background_summary_all <- rbindlist(
+  lapply(
+    background_outputs,
+    `[[`,
+    "dataset_summary"
+  ),
+  fill = TRUE
+)
+
+background_tissue_beta_all <- rbindlist(
+  lapply(
+    background_outputs,
+    `[[`,
+    "tissue_mean_df"
+  ),
+  fill = TRUE
+)
+
+## Each DMR should appear once in every background dataset
+stopifnot(
+  nrow(background_summary_all) ==
+    nrow(dmrs) * nrow(background_files)
+)
+
+table(background_summary_all$dataset)
+## Save the dataset-level summary
+fwrite(
+  background_summary_all,
+  file = file.path(
+    outdir,
+    "background_DMR_beta_summary_by_dataset.csv"
+  )
+)
+
+fwrite(background_tissue_beta_all,
+  file = file.path(outdir,"background_DMR_beta_by_tissue_group.csv"))
+```
+
+
+## Summarize each DMR across all background datasets
+
+```{r summarize-background-across-datasets}
+expected_background_datasets <- nrow(background_files)
+
+background_cross_dataset_summary <- background_summary_all[
+  ,
+  .(
+    n_background_datasets = uniqueN(dataset),
+
+    n_background_pass = sum(
+      background_pass %in% TRUE
+    ),
+
+    min_nCpG_background = safe_min(
+      nCpG_background
+    ),
+
+    max_nCpG_background = safe_max(
+      nCpG_background
+    ),
+
+    min_beta_across_background = safe_min(
+  min_group_mean_beta),
+
+    mean_beta_across_background = safe_mean(
+      mean_beta_all_background
+    ),
+
+    background_pass_all =
+      uniqueN(dataset) == expected_background_datasets &&
+      all(background_pass %in% TRUE)
+  ),
+  by = .(
+    DMR_ID,
+    chr,
+    start,
+    end
+  )
+]
+
+fwrite(background_cross_dataset_summary,
+       file = file.path(outdir,"background_cross_dataset_summary.csv"))
+```
+
+## Merge the background results with the original DMR information
+
+```{r merge-background-results-with-dmrs}
+final_dmrs <- merge(
+  as.data.table(dmrs),
+  background_cross_dataset_summary,
+  by = c("DMR_ID", "chr", "start", "end"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+stopifnot(
+  nrow(final_dmrs) == nrow(dmrs)
+)
+
+fwrite(
+  final_dmrs,
+  file = file.path(
+    outdir,
+    "all_DMRs_with_background_results.csv"
+  )
+)
+```
+
+
+#### Retain DMRs that pass all background filters
+
+Final criterion:
+1. The DMR passes in every background dataset.
+2. Every dataset contains at least 6 mapped CpGs.
+3. The lowest normal tissue-group mean beta is above 0.20.
+
+```{r retain-background-passed-dmrs}
+
+background_filtered_dmrs <- final_dmrs[
+  background_pass_all %in% TRUE &
+    min_nCpG_background >= min_bg_cpg &
+    min_beta_across_background > beta_threshold
+]
+
+fwrite(background_filtered_dmrs,
+  file = file.path(outdir,
+    "background_filtered_hypo_DMRs_beta_gt_0.2_nCpG_gt5.csv"))
+```
+
+## Save all important background-filtering objects
+
+```{r save-background-filtering-rdata}
+step3_background_output <- list(
+  dmrs = dmrs,
+  dmr_gr = dmr_gr,
+  background_files = background_files,
+  background_summary_all = background_summary_all,
+  background_tissue_beta_all = background_tissue_beta_all,
+  background_cross_dataset_summary =
+    background_cross_dataset_summary,
+  final_dmrs = final_dmrs,
+  background_filtered_dmrs =
+    background_filtered_dmrs,
+  beta_threshold = beta_threshold,
+  min_bg_cpg = min_bg_cpg,
+  robust_dmr_file = robust_dmr_file,
+  outdir = outdir,
+  session_info = sessionInfo()
+)
+
+save(
+  step3_background_output,
+  file = file.path(
+    outdir,
+    "step3_background_filtering_output.RData"
+  )
+)
+```
+
+# Session information
+
+```{r session-information}
+sessionInfo()
+```

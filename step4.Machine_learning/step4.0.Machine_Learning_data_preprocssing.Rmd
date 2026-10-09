@@ -1,0 +1,401 @@
+---
+title: "step4.0.Machine_learning_data_preprocessing"
+author: "YC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    fig_width: 7
+    fig_height: 7
+    theme: cosmo
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE)
+
+```
+
+
+# Overview
+
+This workflow develops and externally validates three DMR-based classifiers for hepatocellular carcinoma (HCC):
+
+1. Preprocess the training dataset (GSE54503) and the external-validation dataset (TCGA-LIHC).
+2. Build DMR-level beta-value features from the retained DMRs.
+3. Train elastic-net/LASSO, random forest, and radial SVM models using the GSE54503 training cohort.
+4. Compare model performance using repeated five-fold cross-validation within the training cohort.
+5. Prepare the full and balanced TCGA-LIHC cohorts for external validation.
+6. Evaluate the trained models in TCGA-LIHC using ROC curves, confusion matrices, probability distributions, and summary performance metrics.
+
+# 🍁🍁Data preprocessing
+
+### ⭐ Dataset 1: GSE54503 preprocessing
+
+GSE54503 was used as the training cohort. The preprocessing steps were completed in Step 2; therefore, the resulting `myLoad` object was copied into this directory for model development.
+
+The preprocessing included:
+
+1. Extracting the processed beta-value matrix from the GEO `ExpressionSet` using `exprs(eset[[1]])`.
+2. Obtaining phenotype information from the GEO metadata and classifying samples as Normal or Tumor.
+3. Checking sample IDs and aligning the phenotype table with the beta-value matrix.
+4. Applying `champ.filter()` for quality control and probe filtering.
+5. Saving the resulting `myLoad` object for downstream model training.
+
+### ⭐ Dataset 2: TCGA-LIHC 450K methylation preprocessing
+
+The goal of this module is to:
+
+1. Obtain the processed TCGA-LIHC beta-value matrix.
+2. Build the phenotype table `pD`.
+3. Retain Tumor and Normal samples and strictly align the phenotype table with the beta-value matrix.
+4. Apply `champ.filter()` for probe-level quality control and filtering.
+5. Save the resulting `myLoad` object for external validation.
+
+### Module 0. Clear environment and load required packages
+```{r}
+rm(list = ls())
+options(timeout = 100000)
+options(scipen = 20)
+options(stringsAsFactors = FALSE)
+
+library(data.table)
+library(ChAMP)
+library(stringr)
+```
+
+### Module 1. Read TCGA-LIHC methylation matrix
+
+The processed TCGA-LIHC HumanMethylation450 beta-value matrix was obtained from the UCSC Xena TCGA hub.
+
+Input file:
+
+`TCGA.LIHC.sampleMap%2FHumanMethylation450.gz`
+
+Matrix format:
+
+- rows = CpG probes
+- columns = TCGA samples
+- values = beta values
+
+we use server to download this in advance:
+nohup wget -c \
+"https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LIHC.sampleMap%2FHumanMethylation450.gz" \
+-O TCGA.LIHC.sampleMap%2FHumanMethylation450.gz \
+> TCGA_LIHC_download.log 2>&1 &
+tail -f TCGA_LIHC_download.log
+gzip -t TCGA.LIHC.sampleMap%2FHumanMethylation450.gz
+
+
+```{r}
+beta.m <- fread(
+  "TCGA.LIHC.sampleMap%2FHumanMethylation450.gz",
+  data.table = FALSE,
+  check.names = FALSE
+)
+
+## Check matrix format
+beta.m[1:5, 1:5]
+class(beta.m)
+dim(beta.m)
+colnames(beta.m)[1:10]
+```
+### Module 2. Build standard beta value matrix
+```{r}
+## Set probe IDs as row names
+rownames(beta.m) <- beta.m[, 1]
+
+## Remove the first column containing probe IDs
+beta.m <- beta.m[, -1]
+
+## Convert beta data frame to numeric matrix
+beta.m <- as.matrix(beta.m)
+storage.mode(beta.m) <- "numeric"
+
+## Basic checks
+class(beta.m)
+dim(beta.m)
+head(rownames(beta.m))
+head(colnames(beta.m))
+
+sum(is.na(rownames(beta.m)))
+sum(is.na(colnames(beta.m)))
+
+anyDuplicated(rownames(beta.m))
+anyDuplicated(colnames(beta.m))
+```
+### Module 3. Build phenotype table pD
+```{r}
+## Extract sample names from beta matrix
+sample_names <- colnames(beta.m)
+
+## Extract TCGA sample type code
+## TCGA barcode example:
+##   TCGA-XX-XXXX-01A-...
+## The first two digits of the 4th field indicate sample type.
+sample_type_code <- sapply(
+  strsplit(sample_names, "-"),
+  function(x) substr(x[4], 1, 2)
+)
+
+## Check sample type code distribution
+table(sample_type_code)
+
+## Define group:
+##   01-09 = Tumor
+##   10-19 = Normal
+group <- ifelse(
+  sample_type_code %in% c("01", "02", "03", "04", "05", "06", "07", "08", "09"),
+  "Tumor",
+  ifelse(
+    sample_type_code %in% c("10", "11", "12", "13", "14", "15", "16", "17", "18", "19"),
+    "Normal",
+    "Other"
+  )
+)
+
+## Build phenotype table
+pD <- data.frame(
+  ID = sample_names,
+  sample_type_code = sample_type_code,
+  group = group,
+  project = "TCGA-LIHC",
+  stringsAsFactors = FALSE
+)
+
+## Check group assignment
+table(pD$group)
+
+check_df <- data.frame(
+  SampleID = pD$ID,
+  SampleTypeCode = pD$sample_type_code,
+  Group = pD$group,
+  Project = pD$project
+)
+
+head(check_df, 10)
+tail(check_df, 10)
+```
+### Module 4. Keep only Tumor and Normal samples
+```{r}
+keep_samples <- pD$group %in% c("Tumor", "Normal")
+
+pD <- pD[keep_samples, , drop = FALSE]
+beta.m <- beta.m[, pD$ID, drop = FALSE]
+
+## Set pD row names as sample IDs
+rownames(pD) <- pD$ID
+
+## Final strict alignment check
+identical(colnames(beta.m), rownames(pD))
+stopifnot(identical(colnames(beta.m), rownames(pD)))
+
+## Set group order
+pD$group <- factor(
+  pD$group,
+  levels = c("Normal", "Tumor")
+)
+
+## Sort samples by group
+sample_order <- order(pD$group)
+
+pD <- pD[sample_order, , drop = FALSE]
+beta.m <- beta.m[, rownames(pD), drop = FALSE]
+
+## Final check before ChAMP filtering
+stopifnot(identical(colnames(beta.m), rownames(pD)))
+
+table(pD$group)
+dim(beta.m)
+dim(pD)
+```
+
+### Module 5. Run ChAMP filtering
+The cleaned beta-value matrix and the strictly aligned phenotype table were passed to `champ.filter()` for standard 450K probe-level quality control and filtering.
+```{r}
+myLoad <- champ.filter(
+  beta = beta.m,
+  pd = pD,
+  arraytype = "450K")
+save(myLoad,file = "step0.2_TCGA_LIHC_output.Rdata")
+```
+
+
+### ⭐ Balanced TCGA-LIHC external-validation cohort
+
+The full TCGA-LIHC cohort contained 379 Tumor and 50 Normal samples. To assess model performance in a class-balanced external-validation setting, a balanced subset was constructed by randomly selecting 50 Tumor samples and retaining all 50 available Normal samples.
+
+Sampling was performed without replacement using a fixed random seed (`set.seed(2026)`) to ensure reproducibility. The resulting balanced cohort contained 100 samples, with an equal number of Tumor and Normal samples (50 per group).
+
+The trained models were not refitted using this subset; the balanced cohort was used solely for external validation of models trained in the GSE54503 cohort.
+```{r}
+set.seed(2026)
+
+## Extract beta matrix and phenotype table
+beta_tcga <- as.matrix(myLoad$beta)
+pd_tcga <- as.data.frame(myLoad$pd)
+
+storage.mode(beta_tcga) <- "numeric"
+
+## Make sure sample IDs are available
+if (!"Sample_Name" %in% colnames(pd_tcga)) {
+  pd_tcga$Sample_Name <- rownames(pd_tcga)
+}
+
+rownames(pd_tcga) <- pd_tcga$Sample_Name
+
+## Strict alignment check
+stopifnot(
+  identical(
+    colnames(beta_tcga),
+    rownames(pd_tcga)
+  )
+)
+
+## Check available samples
+print(table(pd_tcga$group))
+print(dim(beta_tcga))
+
+## Extract Tumor and Normal sample IDs
+tumor_ids <- rownames(
+  pd_tcga[
+    pd_tcga$group == "Tumor",
+    ,
+    drop = FALSE
+  ]
+)
+
+normal_ids <- rownames(
+  pd_tcga[
+    pd_tcga$group == "Normal",
+    ,
+    drop = FALSE
+  ]
+)
+
+## Define target sample numbers
+target_tumor <- 50
+target_normal <- 50
+
+## Check whether sufficient samples are available
+if (length(tumor_ids) < target_tumor) {
+  stop(
+    paste0(
+      "Not enough Tumor samples. Available = ",
+      length(tumor_ids),
+      ", target = ",
+      target_tumor
+    )
+  )
+}
+
+if (length(normal_ids) < target_normal) {
+  stop(
+    paste0(
+      "Not enough Normal samples. Available = ",
+      length(normal_ids),
+      ", target = ",
+      target_normal
+    )
+  )
+}
+
+## Randomly select 50 Tumor and 50 Normal samples
+selected_tumor_ids <- sample(
+  tumor_ids,
+  size = target_tumor,
+  replace = FALSE
+)
+
+selected_normal_ids <- sample(
+  normal_ids,
+  size = target_normal,
+  replace = FALSE
+)
+
+## Combine selected sample IDs
+selected_ids <- c(
+  selected_normal_ids,
+  selected_tumor_ids
+)
+
+## Construct balanced phenotype table and beta matrix
+pd_balanced <- pd_tcga[
+  selected_ids,
+  ,
+  drop = FALSE
+]
+
+beta_balanced <- beta_tcga[
+  ,
+  selected_ids,
+  drop = FALSE
+]
+
+## Set group order
+pd_balanced$group <- factor(
+  as.character(pd_balanced$group),
+  levels = c("Normal", "Tumor")
+)
+
+## Sort Normal first, Tumor second
+sample_order <- order(pd_balanced$group)
+
+pd_balanced <- pd_balanced[
+  sample_order,
+  ,
+  drop = FALSE
+]
+
+beta_balanced <- beta_balanced[
+  ,
+  rownames(pd_balanced),
+  drop = FALSE
+]
+
+## Final strict alignment check
+stopifnot(
+  identical(
+    colnames(beta_balanced),
+    rownames(pd_balanced)
+  )
+)
+
+## Check final balanced cohort
+print(table(pd_balanced$group))
+print(dim(beta_balanced))
+print(dim(pd_balanced))
+## Save balanced TCGA-LIHC cohort
+myLoad_balanced <- list(
+  beta = beta_balanced,
+  pd = pd_balanced
+)
+
+## Save RData object
+save(
+  myLoad_balanced,
+  file = "step0.3TCGA_LIHC_balanced_50Tumor_50Normal_output.Rdata"
+)
+
+## Save sample information
+fwrite(
+  pd_balanced,
+  file = "TCGA_LIHC_balanced_50Tumor_50Normal_sample_information.csv"
+)
+
+## Save selected sample IDs
+fwrite(
+  data.frame(
+    Sample = rownames(pd_balanced),
+    Group = pd_balanced$group,
+    stringsAsFactors = FALSE
+  ),
+  file = "TCGA_LIHC_balanced_50Tumor_50Normal_selected_samples.csv"
+)
+```
+

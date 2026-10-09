@@ -1,0 +1,2128 @@
+---
+title: "step4.2.Machine_learning_testing_hypo"
+author: "YC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    fig_width: 7
+    fig_height: 7
+    theme: cosmo
+---
+
+The setup chunk defines the default display behaviour for all subsequent R code chunks.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+  results = "hide",
+  message = FALSE,
+  warning = FALSE)
+```
+
+#🍁🍁 Machine-learning testing in TCGA-LIHC full cohort
+
+The three trained models are externally evaluated in the TCGA-LIHC full cohort and further assessed in a balanced sensitivity-analysis cohort.
+
+### Analysis step 1
+
+```{r b6-analysis-step-1}
+rm(list = ls())
+
+options(timeout = 100000) 
+options(scipen = 20)
+options(stringsAsFactors = F)
+
+set.seed(123)
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 0: Load required packages
+
+This chunk clears the active workspace where specified, sets analysis options, and loads the packages required for the following steps.
+
+```{r b6-module-0-load-required-packages}
+library(data.table)
+library(caret)
+library(pROC)
+library(ggplot2)
+
+```
+
+Interpretation: successful completion confirms that the required packages are available and the analysis environment is ready.
+
+### Module 1: Set input files in current directory
+
+This chunk defines the input files and analysis settings, creates the requested output directory where applicable, and checks that required files are available.
+
+```{r b6-module-1-set-input-files-in-current-direct}
+## Module 1. Set input files in current directory
+training_model_file <- "GSE54503_ML_training_3models_157hypoDMRs.Rdata"
+
+tcga_full_file <- "step0.2_TCGA_LIHC_output.Rdata"
+
+outdir <- "ML_157_hypo_DMRs_full_cohort"
+
+if (!dir.exists(outdir)) {
+  dir.create(
+    outdir,
+    recursive = TRUE
+  )
+}
+
+if (!file.exists(training_model_file)) {
+  stop(paste0("Training model file not found: ", training_model_file))
+}
+
+if (!file.exists(tcga_full_file)) {
+  stop(paste0("TCGA full cohort file not found: ", tcga_full_file))
+}
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 2: Load trained models and training information
+
+This chunk loads the trained models and verifies that all objects required for external testing are present.
+
+```{r b6-module-2-load-trained-models-and-training-}
+load(training_model_file)
+
+required_objects <- c(
+  "model_glmnet",
+  "model_rf",
+  "model_svm",
+  "dmr.tbl",
+  "dmr.cpg.list",
+  "feature_name_map",
+  "ml_df"
+)
+
+missing_objects <- required_objects[!sapply(required_objects, exists)]
+
+if (length(missing_objects) > 0) {
+  stop(paste0(
+    "Missing objects in training Rdata: ",
+    paste(missing_objects, collapse = ", ")
+  ))
+}
+
+cat("\nTraining objects loaded successfully.\n")
+
+cat("\nBest glmnet tuning parameters:\n")
+print(model_glmnet$bestTune)
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 3: Extract model-specific features
+
+This chunk retrieves the predictors required by each model and prepares training-derived medians for external-data imputation.
+
+```{r b6-module-3-extract-model-specific-features}
+get_model_features <- function(model, fallback_ml_df = ml_df) {
+  
+  if (!is.null(model$trainingData)) {
+    features <- setdiff(colnames(model$trainingData), ".outcome")
+  } else {
+    features <- setdiff(colnames(fallback_ml_df), "group")
+  }
+  
+  return(features)
+}
+
+features_glmnet <- get_model_features(model_glmnet)
+features_rf <- get_model_features(model_rf)
+features_svm <- get_model_features(model_svm)
+
+all_training_features <- unique(c(
+  features_glmnet,
+  features_rf,
+  features_svm
+))
+
+cat("\nNumber of model features:\n")
+cat("Elastic-net:", length(features_glmnet), "\n")
+cat("Random Forest:", length(features_rf), "\n")
+cat("Radial SVM:", length(features_svm), "\n")
+cat("All unique features:", length(all_training_features), "\n")
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 4: Prepare training medians for missing-value imputation
+
+This chunk retrieves the predictors required by each model and prepares training-derived medians for external-data imputation.
+
+```{r b6-module-4-prepare-training-medians-for-miss}
+training_medians <- sapply(
+  ml_df[, all_training_features, drop = FALSE],
+  function(x) median(as.numeric(x), na.rm = TRUE)
+)
+
+training_medians[is.na(training_medians)] <- 0.5
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 5: Load TCGA full myLoad object
+
+This chunk loads the TCGA test object and extracts its beta matrix and phenotype table.
+
+```{r b6-module-5-load-tcga-full-myload-object}
+env <- new.env()
+loaded_objects <- load(tcga_full_file, envir = env)
+
+if (!"myLoad" %in% loaded_objects) {
+  stop(paste0(
+    "Object myLoad was not found in: ",
+    tcga_full_file,
+    ". Objects found: ",
+    paste(loaded_objects, collapse = ", ")
+  ))
+}
+
+myLoad_tcga <- env$myLoad
+
+if (!"beta" %in% names(myLoad_tcga)) {
+  stop("myLoad$beta was not found in TCGA full cohort file.")
+}
+
+if (!"pd" %in% names(myLoad_tcga)) {
+  stop("myLoad$pd was not found in TCGA full cohort file.")
+}
+
+beta_tcga <- as.matrix(myLoad_tcga$beta)
+storage.mode(beta_tcga) <- "numeric"
+
+pd_tcga <- as.data.frame(myLoad_tcga$pd)
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 6: Align TCGA phenotype table with beta matrix
+
+This chunk constructs the phenotype table and assigns each sample to the relevant analysis group.
+
+```{r b6-module-6-align-tcga-phenotype-table-with-b}
+if ("ID" %in% colnames(pd_tcga) && setequal(as.character(pd_tcga$ID), colnames(beta_tcga))) {
+  rownames(pd_tcga) <- as.character(pd_tcga$ID)
+}
+
+if (setequal(rownames(pd_tcga), colnames(beta_tcga))) {
+  pd_tcga <- pd_tcga[colnames(beta_tcga), , drop = FALSE]
+}
+
+if (!identical(rownames(pd_tcga), colnames(beta_tcga))) {
+  stop("Sample alignment failed between TCGA beta and pd.")
+}
+
+if (!"group" %in% colnames(pd_tcga)) {
+  stop("Column group was not found in TCGA pd.")
+}
+
+if (!all(as.character(pd_tcga$group) %in% c("Tumor", "Normal"))) {
+  stop("Unexpected group labels found in TCGA pd.")
+}
+
+pd_tcga$group <- factor(
+  as.character(pd_tcga$group),
+  levels = c("Tumor", "Normal")
+)
+
+cat("\nTCGA full cohort sample distribution:\n")
+print(table(pd_tcga$group, useNA = "ifany"))
+
+if ("project" %in% colnames(pd_tcga)) {
+  print(table(pd_tcga$project, pd_tcga$group))
+}
+
+cat("\nTCGA beta dimension:\n")
+print(dim(beta_tcga))
+
+cat("\nTCGA pd dimension:\n")
+print(dim(pd_tcga))
+
+## Map model-required features back to original DMR IDs
+testing_feature_map <- feature_name_map[
+  match(all_training_features, feature_name_map$Feature),
+  ,
+  drop = FALSE
+]
+
+if (any(is.na(testing_feature_map$DMR_id))) {
+  stop("Some model-required features could not be mapped back to DMR IDs.")
+}
+
+testing_dmr_ids <- testing_feature_map$DMR_id
+
+testing_dmr_idx <- match(
+  testing_dmr_ids,
+  dmr.tbl$DMR_id
+)
+
+if (any(is.na(testing_dmr_idx))) {
+  stop("Some model-required DMR IDs were not found in dmr.tbl.")
+}
+
+dmr.tbl.testing <- dmr.tbl[
+  testing_dmr_idx,
+  ,
+  drop = FALSE
+]
+
+dmr.cpg.list.testing <- dmr.cpg.list[
+  testing_dmr_idx
+]
+```
+
+Interpretation: the group-frequency table should contain the expected sample classes without unexpected or missing labels.
+
+### Module 7: Build TCGA DMR-level beta matrix
+
+This chunk aggregates CpG beta values into DMR-level features, handles missing values, and records the feature-name mapping.
+
+```{r b6-module-7-build-tcga-dmr-level-beta-matrix}
+dmr_beta_mat <- matrix(
+  NA_real_,
+  nrow = ncol(beta_tcga),
+  ncol = nrow(dmr.tbl.testing)
+)
+
+rownames(dmr_beta_mat) <- colnames(beta_tcga)
+colnames(dmr_beta_mat) <- dmr.tbl.testing$DMR_id
+
+for (i in seq_len(nrow(dmr.tbl.testing))) {
+  
+  cpgs_present <- intersect(
+    dmr.cpg.list.testing[[i]],
+    rownames(beta_tcga)
+  )
+  
+  if (length(cpgs_present) > 0) {
+    dmr_beta_mat[, i] <- colMeans(
+      beta_tcga[cpgs_present, , drop = FALSE],
+      na.rm = TRUE
+    )
+  }
+}
+
+dmr_beta_mat[is.nan(dmr_beta_mat)] <- NA_real_
+
+```
+
+Interpretation: the coverage summaries indicate how many candidate DMRs can be represented by available array probes, while the resulting matrix supplies the model predictors.
+
+### Module 8: Check CpG coverage in TCGA full cohort
+
+This chunk performs the operations described in **Module 8: Check CpG coverage in TCGA full cohort**.
+
+```{r b6-module-8-check-cpg-coverage-in-tcga-full-c}
+cpg_coverage <- data.frame(
+  DMR_id = dmr.tbl.testing$DMR_id,
+  nCpG_present_TCGA_full = sapply(
+    dmr.cpg.list.testing,
+    function(x) length(intersect(x, rownames(beta_tcga)))
+  ),
+  stringsAsFactors = FALSE
+)
+
+fwrite(
+  cpg_coverage,
+  file = file.path(
+    outdir,
+    "TCGA_full_DMR_CpG_coverage.csv"
+  )
+)
+
+cat("\nCpG coverage summary in TCGA full cohort:\n")
+print(summary(cpg_coverage$nCpG_present_TCGA_full))
+
+cat("\nNumber of DMRs with zero CpG coverage in TCGA:\n")
+print(sum(cpg_coverage$nCpG_present_TCGA_full == 0))
+
+zero_coverage <- cpg_coverage$nCpG_present_TCGA_full == 0
+
+if (any(zero_coverage)) {
+  
+  zero_dmr <- cpg_coverage$DMR_id[zero_coverage]
+  
+  stop(
+    paste0(
+      "Some model-required DMRs have zero CpG coverage in TCGA: ",
+      paste(zero_dmr, collapse = ", ")
+    )
+  )
+}
+
+```
+
+Interpretation: the coverage summaries indicate how many candidate DMRs can be represented by available array probes, while the resulting matrix supplies the model predictors.
+
+### Module 9: Map DMR IDs to training feature names
+
+This chunk maps DMR intervals to annotated CpG probes and summarizes probe availability in the dataset.
+
+```{r b6-module-9-map-dmr-ids-to-training-feature-n}
+feature_names <- feature_name_map$Feature[
+  match(colnames(dmr_beta_mat), feature_name_map$DMR_id)
+]
+
+if (any(is.na(feature_names))) {
+  missing_dmr_ids <- colnames(dmr_beta_mat)[is.na(feature_names)]
+  stop(paste0(
+    "Some TCGA DMRs could not be mapped to training feature names: ",
+    paste(head(missing_dmr_ids, 20), collapse = ", ")
+  ))
+}
+
+colnames(dmr_beta_mat) <- feature_names
+
+missing_features <- setdiff(all_training_features, colnames(dmr_beta_mat))
+
+if (length(missing_features) > 0) {
+  stop(paste0(
+    "These training features are missing in TCGA matrix: ",
+    paste(missing_features, collapse = ", ")
+  ))
+}
+
+dmr_beta_mat <- dmr_beta_mat[, all_training_features, drop = FALSE]
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 10: Impute missing values using training medians
+
+This chunk retrieves the predictors required by each model and prepares training-derived medians for external-data imputation.
+
+```{r b6-module-10-impute-missing-values-using-trai}
+for (fn in all_training_features) {
+  
+  if (any(is.na(dmr_beta_mat[, fn]))) {
+    dmr_beta_mat[is.na(dmr_beta_mat[, fn]), fn] <- training_medians[fn]
+  }
+}
+
+if (any(is.na(dmr_beta_mat))) {
+  stop("There are still missing values after imputation.")
+}
+
+```
+
+Interpretation: successful completion means no missing predictor values remain before external prediction.
+
+### Module 11: Build final TCGA full testing dataframe
+
+This chunk assembles the final external-test data frame and saves the corresponding DMR-level feature matrix.
+
+```{r b6-module-11-build-final-tcga-full-testing-da}
+test_df_full <- data.frame(
+  group = pd_tcga$group,
+  dmr_beta_mat,
+  check.names = FALSE
+)
+
+rownames(test_df_full) <- rownames(pd_tcga)
+
+cat("\nTCGA full testing dataframe:\n")
+print(dim(test_df_full))
+print(table(test_df_full$group))
+
+
+fwrite(
+  data.frame(
+    Sample = rownames(test_df_full),
+    Group = test_df_full$group,
+    dmr_beta_mat,
+    check.names = FALSE
+  ),
+  file = file.path(
+    outdir,
+    "TCGA_full_DMR_level_beta_matrix_for_testing.csv"
+  )
+)
+
+```
+
+Interpretation: the displayed dimensions and class counts confirm the number of external samples and model features entering prediction.
+
+### Module 12: Helper function to evaluate one model
+
+This chunk defines helper functions used to standardize inputs and support the downstream workflow.
+
+```{r b6-module-12-helper-function-to-evaluate-one-}
+evaluate_one_model <- function(model, model_name, test_df, model_features) {
+  
+  x_test <- test_df[, model_features, drop = FALSE]
+  
+  prob <- predict(
+    model,
+    newdata = x_test,
+    type = "prob"
+  )
+  
+  pred_class <- predict(
+    model,
+    newdata = x_test,
+    type = "raw"
+  )
+  
+  obs <- factor(
+    as.character(test_df$group),
+    levels = c("Tumor", "Normal")
+  )
+  
+  pred_class <- factor(
+    as.character(pred_class),
+    levels = c("Tumor", "Normal")
+  )
+  
+  roc_obj <- roc(
+    response = obs,
+    predictor = prob$Tumor,
+    levels = c("Normal", "Tumor"),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  auc_value <- as.numeric(auc(roc_obj))
+  
+  cm <- confusionMatrix(
+    data = pred_class,
+    reference = obs,
+    positive = "Tumor"
+  )
+  
+  performance <- data.frame(
+    Model = model_name,
+    AUC = auc_value,
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
+    stringsAsFactors = FALSE
+  )
+  
+  pred_df <- data.frame(
+    Sample = rownames(test_df),
+    Observed = obs,
+    Predicted = pred_class,
+    Prob_Tumor = prob$Tumor,
+    Prob_Normal = prob$Normal,
+    Model = model_name,
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(
+    performance = performance,
+    predictions = pred_df,
+    roc = roc_obj,
+    confusion_matrix = cm
+  ))
+}
+
+```
+
+Interpretation: these functions do not produce a biological result directly; they standardize inputs and enforce consistent processing.
+
+### 🍁🍁 Module 13: Test three models in TCGA full cohort
+
+This chunk applies each trained classifier to the external cohort using its required feature set.
+
+```{r b6-module-13-test-three-models-in-tcga-full-c}
+res_glmnet_full <- evaluate_one_model(
+  model = model_glmnet,
+  model_name = "Elastic-net",
+  test_df = test_df_full,
+  model_features = features_glmnet
+)
+
+res_rf_full <- evaluate_one_model(
+  model = model_rf,
+  model_name = "Random Forest",
+  test_df = test_df_full,
+  model_features = features_rf
+)
+
+res_svm_full <- evaluate_one_model(
+  model = model_svm,
+  model_name = "Radial SVM",
+  test_df = test_df_full,
+  model_features = features_svm
+)
+
+```
+
+Interpretation: the returned objects contain the sample-level predictions and the metrics required for model comparison.
+
+### Module 14: Combine and save performance results
+
+This chunk combines the performance and prediction results from the three classifiers and saves the corresponding evaluation outputs.
+
+```{r b6-module-14-combine-and-save-performance-res}
+performance_full <- rbind(
+  res_glmnet_full$performance,
+  res_rf_full$performance,
+  res_svm_full$performance
+)
+
+predictions_full <- rbind(
+  res_glmnet_full$predictions,
+  res_rf_full$predictions,
+  res_svm_full$predictions
+)
+
+cat("\nTCGA full model performance:\n")
+print(performance_full)
+
+fwrite(
+  performance_full,
+  file = file.path(outdir,"TCGA_full_model_performance.csv"
+))
+
+fwrite(
+  predictions_full,
+  file = file.path(outdir,"TCGA_full_model_predictions.csv"
+))
+
+capture.output(
+  res_glmnet_full$confusion_matrix,
+  file = file.path(outdir, "TCGA_full_confusion_matrix_elastic_net.txt"
+))
+
+capture.output(
+  res_rf_full$confusion_matrix,
+  file = file.path(outdir,"TCGA_full_confusion_matrix_random_forest.txt"
+))
+
+capture.output(
+  res_svm_full$confusion_matrix,
+  file = file.path(outdir,"TCGA_full_confusion_matrix_radial_svm.txt"
+))
+
+```
+
+Interpretation: higher ROC, sensitivity, and specificity indicate stronger discrimination, but external-cohort results remain the primary validation evidence.
+
+### Module 15: Plot ROC curves for three models
+
+This chunk prepares ROC coordinates and generates the ROC visualization for the three models.
+
+```{r b6-module-15-plot-roc-curves-for-three-models}
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.4f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+  
+  df <- df[order(df$FPR, df$TPR), ]
+  
+  return(df)
+}
+
+roc_df_full <- rbind(
+  roc_to_df(
+    res_glmnet_full$roc,
+    "Elastic-net",
+    res_glmnet_full$performance$AUC
+  ),
+  roc_to_df(
+    res_rf_full$roc,
+    "Random Forest",
+    res_rf_full$performance$AUC
+  ),
+  roc_to_df(
+    res_svm_full$roc,
+    "Radial SVM",
+    res_svm_full$performance$AUC
+  )
+)
+```
+
+Interpretation: curves closer to the upper-left corner and larger AUC values indicate better separation of Tumor and Normal samples.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b6-module-15-plot-roc-curves-for-three-models-2}
+
+p_roc_full <- ggplot(
+  roc_df_full,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_step(linewidth = 1.2, direction = "vh") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "ROC curves in TCGA full cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_roc_full
+
+ggsave(
+  filename = file.path(outdir,"TCGA_full_ROC_curves_3models_improved.png"),
+  plot = p_roc_full,
+  width = 8,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir,"TCGA_full_ROC_curves_3models_improved.pdf"),
+  plot = p_roc_full,
+  width = 8,
+  height = 7
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+### Module 15.1: Zoomed ROC plot near top-left corner
+
+This chunk prepares ROC coordinates and generates the ROC visualization for the three models.
+
+```{r b6-module-15-1-zoomed-roc-plot-near-top-left-}
+
+p_roc_full_zoom <- ggplot(
+  roc_df_full,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_step(linewidth = 1.2, direction = "vh") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  coord_cartesian(
+    xlim = c(0, 0.10),
+    ylim = c(0.90, 1.00)
+  ) +
+  labs(
+    title = "Zoomed ROC curves in TCGA full cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_roc_full_zoom
+
+ggsave(
+  filename = file.path(outdir, "TCGA_full_ROC_curves_3models_zoomed.png"),
+  plot = p_roc_full_zoom,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+Interpretation: curves closer to the upper-left corner and larger AUC values indicate better separation of Tumor and Normal samples.
+
+This continuation of **Module 15.1: Zoomed ROC plot near top-left corner** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b6-module-15-1-zoomed-roc-plot-near-top-left--2}
+
+ggsave(
+  filename = file.path(outdir,"TCGA_full_ROC_curves_3models_zoomed.pdf"),
+  plot = p_roc_full_zoom,
+  width = 8,
+  height = 6
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+### Module 16: Plot model performance heatmap
+
+This chunk reshapes the performance table and displays the main evaluation metrics as a heatmap.
+
+```{r b6-module-16-plot-model-performance-heatmap}
+library(data.table)
+library(ggplot2)
+
+performance_heat <- performance_full[, c(
+  "Model",
+  "AUC",
+  "Accuracy",
+  "Sensitivity",
+  "Specificity",
+  "Balanced_Accuracy"
+)]
+
+performance_heat <- as.data.table(performance_heat)
+
+performance_heat <- data.table::melt(
+  performance_heat,
+  id.vars = "Model",
+  variable.name = "Metric",
+  value.name = "Value"
+)
+
+performance_heat$Metric <- factor(
+  performance_heat$Metric,
+  levels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced_Accuracy"),
+  labels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced accuracy")
+)
+
+performance_heat$Model <- factor(
+  performance_heat$Model,
+  levels = c("Elastic-net", "Random Forest", "Radial SVM")
+)
+```
+
+Interpretation: the annotations allow small differences among otherwise high-performing models to be compared directly.
+
+This continuation of **Module 16: Plot model performance heatmap** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b6-module-16-plot-model-performance-heatmap-2}
+
+p_heat_full <- ggplot(
+  performance_heat,
+  aes(x = Metric, y = Model, fill = Value)
+) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    size = 5
+  ) +
+  scale_fill_gradient(
+  low = "#fdc771",
+  high = "#e14c48"
+)+
+  labs(
+    title = "Model performance in TCGA full cohort",
+    x = NULL,
+    y = NULL,
+    fill = "Performance"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+p_heat_full
+
+ggsave(
+  filename = file.path(outdir,"TCGA_full_model_performance_heatmap.png"),
+  plot = p_heat_full,
+  width = 9,
+  height = 4.5,
+  dpi = 300
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 16: Plot model performance heatmap** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b6-module-16-plot-model-performance-heatmap-3}
+
+ggsave(
+  filename = file.path(outdir,"TCGA_full_model_performance_heatmap.pdf"),
+  plot = p_heat_full,
+  width = 9,
+  height = 4.5
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 16: Plot model performance heatmap** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b6-module-16-plot-model-performance-heatmap-4}
+## Set the display order of observed groups
+predictions_full$Observed <- factor(
+  as.character(predictions_full$Observed),
+  levels = c("Normal", "Tumor")
+)
+
+## Set a consistent model display order
+predictions_full$Model <- factor(
+  predictions_full$Model,
+  levels = c(
+    "Elastic-net",
+    "Random Forest",
+    "Radial SVM"
+  )
+)
+p_prob_full <- ggplot(
+  predictions_full,
+  aes(x = Observed, y = Prob_Tumor, color = Observed, fill = Observed)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.55,
+    alpha = 0.25
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.45,
+    size = 1.4
+  ) +
+  facet_wrap(~ Model, nrow = 1) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  labs(
+    title = "Predicted Tumor probability in TCGA full cohort",
+    x = "Observed group",
+    y = "Predicted probability of Tumor",
+    color = "Observed group",
+    fill = "Observed group"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    legend.position = "top"
+  )
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 16: Plot model performance heatmap** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b6-module-16-plot-model-performance-heatmap-5}
+
+p_prob_full
+ggsave(
+  filename = file.path(outdir,"TCGA_full_predicted_Tumor_probability_distribution.png"),
+  plot = p_prob_full,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir,"TCGA_full_predicted_Tumor_probability_distribution.pdf"),
+  plot = p_prob_full,
+  width = 10,
+  height = 5
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+### Module 17: Save all full TCGA testing objects
+
+This chunk saves the principal analysis objects and result tables for reproducibility and downstream use.
+
+```{r b6-module-17-save-all-full-tcga-testing-objec}
+save(
+  test_df_full,
+  performance_full,
+  predictions_full,
+  roc_df_full,
+  p_roc_full,
+  res_glmnet_full,
+  res_rf_full,
+  res_svm_full,
+  file = file.path(outdir,"TCGA_full_testing_results_3models.Rdata")
+)
+
+```
+
+Interpretation: the printed file names or paths identify the reusable objects and result tables generated by this stage.
+
+### Module 18: Final summary
+
+This chunk prints the final model-performance summary for review.
+
+```{r b6-module-18-final-summary}
+
+cat("\nFinal TCGA full model performance:\n")
+print(performance_full)
+
+```
+
+Interpretation: use this table to compare the final performance estimates across the three models.
+
+# 🍁🍁External validation in the TCGA balanced cohort
+
+The same three models are evaluated in the balanced TCGA cohort to assess performance under a less imbalanced class distribution.
+
+### Analysis step 1
+
+This chunk performs the operations described in **Analysis step 1**.
+
+```{r b7-analysis-step-1}
+rm(list = ls())
+
+options(timeout = 100000) 
+options(scipen = 20)
+options(stringsAsFactors = F)
+
+set.seed(123)
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 0: Load required packages
+
+This chunk clears the active workspace where specified, sets analysis options, and loads the packages required for the following steps.
+
+```{r b7-module-0-load-required-packages}
+library(data.table)
+library(caret)
+library(pROC)
+library(ggplot2)
+
+```
+
+Interpretation: successful completion confirms that the required packages are available and the analysis environment is ready.
+
+### Module 1: Set input files in current directory
+
+This chunk defines the input files and analysis settings, creates the requested output directory where applicable, and checks that required files are available.
+
+```{r b7-module-1-set-input-files-in-current-direct}
+
+training_model_file <- "GSE54503_ML_training_3models_157hypoDMRs.Rdata"
+
+  tcga_balanced_file <- "step0.3TCGA_LIHC_balanced_50Tumor_50Normal_output.Rdata"
+
+if (!file.exists(training_model_file)) {
+  stop(paste0("Training model file not found: ", training_model_file))
+}
+
+if (!file.exists(tcga_balanced_file)) {
+  stop(paste0("TCGA balanced file not found: ", tcga_balanced_file))
+}
+
+outdir <- "ML_157_hypo_DMRs_balanced"
+
+if (!dir.exists(outdir)) {
+  dir.create(
+    outdir,
+    recursive = TRUE
+  )
+}
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 2: Load trained models and training information
+
+This chunk loads the trained models and verifies that all objects required for external testing are present.
+
+```{r b7-module-2-load-trained-models-and-training-}
+
+load(training_model_file)
+
+required_objects <- c(
+  "model_glmnet",
+  "model_rf",
+  "model_svm",
+  "dmr.tbl",
+  "dmr.cpg.list",
+  "feature_name_map",
+  "ml_df"
+)
+
+missing_objects <- required_objects[!sapply(required_objects, exists)]
+
+if (length(missing_objects) > 0) {
+  stop(paste0(
+    "Missing objects in training Rdata: ",
+    paste(missing_objects, collapse = ", ")
+  ))
+}
+
+cat("\nTraining objects loaded successfully.\n")
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 3: Extract model-specific features
+
+This chunk retrieves the predictors required by each model and prepares training-derived medians for external-data imputation.
+
+```{r b7-module-3-extract-model-specific-features}
+
+get_model_features <- function(model, fallback_ml_df = ml_df) {
+  
+  if (!is.null(model$trainingData)) {
+    features <- setdiff(colnames(model$trainingData), ".outcome")
+  } else {
+    features <- setdiff(colnames(fallback_ml_df), "group")
+  }
+  
+  return(features)
+}
+
+features_glmnet <- get_model_features(model_glmnet)
+features_rf <- get_model_features(model_rf)
+features_svm <- get_model_features(model_svm)
+
+all_training_features <- unique(c(
+  features_glmnet,
+  features_rf,
+  features_svm
+))
+
+cat("\nNumber of model features:\n")
+cat("Elastic-net:", length(features_glmnet), "\n")
+cat("Random Forest:", length(features_rf), "\n")
+cat("Radial SVM:", length(features_svm), "\n")
+cat("All unique features:", length(all_training_features), "\n")
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 4: Prepare training medians for missing-value imputation
+
+This chunk retrieves the predictors required by each model and prepares training-derived medians for external-data imputation.
+
+```{r b7-module-4-prepare-training-medians-for-miss}
+training_medians <- sapply(
+  ml_df[, all_training_features, drop = FALSE],
+  function(x) median(as.numeric(x), na.rm = TRUE)
+)
+
+training_medians[is.na(training_medians)] <- 0.5
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 5: Load TCGA balanced myLoad object
+
+This chunk loads the TCGA test object and extracts its beta matrix and phenotype table.
+
+```{r b7-module-5-load-tcga-balanced-myload-object}
+env <- new.env()
+loaded_objects <- load(tcga_balanced_file, envir = env)
+
+if (!"myLoad_balanced" %in% loaded_objects) {
+  stop(paste0(
+    "Object myLoad_balanced was not found in: ",
+    tcga_balanced_file,
+    ". Objects found: ",
+    paste(loaded_objects, collapse = ", ")
+  ))
+}
+
+myLoad_tcga <- env$myLoad_balanced
+
+if (!"beta" %in% names(myLoad_tcga)) {
+  stop("myLoad$beta was not found in TCGA balanced file.")
+}
+
+if (!"pd" %in% names(myLoad_tcga)) {
+  stop("myLoad$pd was not found in TCGA balanced file.")
+}
+
+beta_tcga <- as.matrix(myLoad_tcga$beta)
+storage.mode(beta_tcga) <- "numeric"
+
+pd_tcga <- as.data.frame(myLoad_tcga$pd)
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 6: Align TCGA phenotype table with beta matrix
+
+This chunk constructs the phenotype table and assigns each sample to the relevant analysis group.
+
+```{r b7-module-6-align-tcga-phenotype-table-with-b}
+
+if ("ID" %in% colnames(pd_tcga) && setequal(as.character(pd_tcga$ID), colnames(beta_tcga))) {
+  rownames(pd_tcga) <- as.character(pd_tcga$ID)
+}
+
+if (setequal(rownames(pd_tcga), colnames(beta_tcga))) {
+  pd_tcga <- pd_tcga[colnames(beta_tcga), , drop = FALSE]
+}
+
+if (!identical(rownames(pd_tcga), colnames(beta_tcga))) {
+  stop("Sample alignment failed between TCGA beta and pd.")
+}
+
+if (!"group" %in% colnames(pd_tcga)) {
+  stop("Column group was not found in TCGA pd.")
+}
+
+if (!all(as.character(pd_tcga$group) %in% c("Tumor", "Normal"))) {
+  stop("Unexpected group labels found in TCGA pd.")
+}
+
+pd_tcga$group <- factor(
+  as.character(pd_tcga$group),
+  levels = c("Tumor", "Normal")
+)
+
+cat("\nTCGA balanced cohort sample distribution:\n")
+print(table(pd_tcga$group, useNA = "ifany"))
+
+if ("project" %in% colnames(pd_tcga)) {
+  print(table(pd_tcga$project, pd_tcga$group))
+}
+
+cat("\nTCGA beta dimension:\n")
+print(dim(beta_tcga))
+
+cat("\nTCGA pd dimension:\n")
+print(dim(pd_tcga))
+## Map model-required features back to original DMR IDs
+testing_feature_map <- feature_name_map[
+  match(all_training_features, feature_name_map$Feature),
+  ,
+  drop = FALSE
+]
+
+if (any(is.na(testing_feature_map$DMR_id))) {
+  stop("Some model-required features could not be mapped back to DMR IDs.")
+}
+
+testing_dmr_ids <- testing_feature_map$DMR_id
+
+testing_dmr_idx <- match(
+  testing_dmr_ids,
+  dmr.tbl$DMR_id
+)
+
+if (any(is.na(testing_dmr_idx))) {
+  stop("Some model-required DMR IDs were not found in dmr.tbl.")
+}
+
+dmr.tbl.testing <- dmr.tbl[
+  testing_dmr_idx,
+  ,
+  drop = FALSE
+]
+
+dmr.cpg.list.testing <- dmr.cpg.list[
+  testing_dmr_idx
+]
+```
+
+Interpretation: the group-frequency table should contain the expected sample classes without unexpected or missing labels.
+
+### Module 7: Build TCGA DMR-level beta matrix
+
+This chunk aggregates CpG beta values into DMR-level features, handles missing values, and records the feature-name mapping.
+
+```{r b7-module-7-build-tcga-dmr-level-beta-matrix}
+dmr_beta_mat <- matrix(
+  NA_real_,
+  nrow = ncol(beta_tcga),
+  ncol = nrow(dmr.tbl.testing)
+)
+
+rownames(dmr_beta_mat) <- colnames(beta_tcga)
+colnames(dmr_beta_mat) <- dmr.tbl.testing$DMR_id
+
+for (i in seq_len(nrow(dmr.tbl.testing))) {
+  
+  cpgs_present <- intersect(
+    dmr.cpg.list.testing[[i]],
+    rownames(beta_tcga)
+  )
+  
+  if (length(cpgs_present) > 0) {
+    dmr_beta_mat[, i] <- colMeans(
+      beta_tcga[cpgs_present, , drop = FALSE],
+      na.rm = TRUE
+    )
+  }
+}
+
+dmr_beta_mat[is.nan(dmr_beta_mat)] <- NA_real_
+
+```
+
+Interpretation: the coverage summaries indicate how many candidate DMRs can be represented by available array probes, while the resulting matrix supplies the model predictors.
+
+### Module 8: Check CpG coverage in TCGA balanced cohort
+
+This chunk assesses CpG coverage of the retained DMRs in the balanced TCGA cohort.
+
+```{r b7-module-8-check-cpg-coverage-in-tcga-balanc}
+cpg_coverage <- data.frame(
+  DMR_id = dmr.tbl.testing$DMR_id,
+  nCpG_present_TCGA_balanced = sapply(
+    dmr.cpg.list.testing,
+    function(x) length(intersect(x, rownames(beta_tcga)))
+  ),
+  stringsAsFactors = FALSE
+)
+
+fwrite(
+  cpg_coverage,
+  file = file.path(outdir, "TCGA_balanced_DMR_CpG_coverage.csv")
+)
+
+cat("\nCpG coverage summary in TCGA balanced cohort:\n")
+print(summary(cpg_coverage$nCpG_present_TCGA_balanced))
+cat("\nNumber of DMRs with zero CpG coverage in TCGA balanced cohort:\n")
+print(sum(cpg_coverage$nCpG_present_TCGA_balanced == 0))
+
+zero_coverage <- cpg_coverage$nCpG_present_TCGA_balanced == 0
+
+if (any(zero_coverage)) {
+  
+  zero_dmr <- cpg_coverage$DMR_id[zero_coverage]
+  
+  stop(
+    paste0(
+      "Some model-required DMRs have zero CpG coverage in TCGA balanced cohort: ",
+      paste(zero_dmr, collapse = ", ")
+    )
+  )
+}
+```
+
+Interpretation: the coverage summaries indicate how many candidate DMRs can be represented by available array probes, while the resulting matrix supplies the model predictors.
+
+### Module 9: Map DMR IDs to training feature names
+
+This chunk maps DMR intervals to annotated CpG probes and summarizes probe availability in the dataset.
+
+```{r b7-module-9-map-dmr-ids-to-training-feature-n}
+feature_names <- feature_name_map$Feature[
+  match(colnames(dmr_beta_mat), feature_name_map$DMR_id)
+]
+
+if (any(is.na(feature_names))) {
+  missing_dmr_ids <- colnames(dmr_beta_mat)[is.na(feature_names)]
+  stop(paste0(
+    "Some TCGA DMRs could not be mapped to training feature names: ",
+    paste(head(missing_dmr_ids, 20), collapse = ", ")
+  ))
+}
+
+colnames(dmr_beta_mat) <- feature_names
+
+missing_features <- setdiff(all_training_features, colnames(dmr_beta_mat))
+
+if (length(missing_features) > 0) {
+  stop(paste0(
+    "These training features are missing in TCGA matrix: ",
+    paste(missing_features, collapse = ", ")
+  ))
+}
+
+dmr_beta_mat <- dmr_beta_mat[, all_training_features, drop = FALSE]
+
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+### Module 10: Impute missing values using training medians
+
+This chunk retrieves the predictors required by each model and prepares training-derived medians for external-data imputation.
+
+```{r b7-module-10-impute-missing-values-using-trai}
+
+for (fn in all_training_features) {
+  
+  if (any(is.na(dmr_beta_mat[, fn]))) {
+    dmr_beta_mat[is.na(dmr_beta_mat[, fn]), fn] <- training_medians[fn]
+  }
+}
+
+if (any(is.na(dmr_beta_mat))) {
+  stop("There are still missing values after imputation.")
+}
+
+```
+
+Interpretation: successful completion means no missing predictor values remain before external prediction.
+
+### Module 11: Build final TCGA balanced testing dataframe
+
+This chunk assembles the final external-test data frame and saves the corresponding DMR-level feature matrix.
+
+```{r b7-module-11-build-final-tcga-balanced-testin}
+test_df_balanced <- data.frame(
+  group = pd_tcga$group,
+  dmr_beta_mat,
+  check.names = FALSE
+)
+
+rownames(test_df_balanced) <- rownames(pd_tcga)
+
+cat("\nTCGA balanced testing dataframe:\n")
+print(dim(test_df_balanced))
+print(table(test_df_balanced$group))
+
+fwrite(
+  data.frame(
+    Sample = rownames(test_df_balanced),
+    Group = test_df_balanced$group,
+    dmr_beta_mat,
+    check.names = FALSE
+  ),
+  file = file.path(outdir,"TCGA_balanced_DMR_level_beta_matrix_for_testing.csv"
+))
+
+```
+
+Interpretation: the displayed dimensions and class counts confirm the number of external samples and model features entering prediction.
+
+### Module 12: Helper function to evaluate one model
+
+This chunk defines helper functions used to standardize inputs and support the downstream workflow.
+
+```{r b7-module-12-helper-function-to-evaluate-one-}
+evaluate_one_model <- function(model, model_name, test_df, model_features) {
+  
+  x_test <- test_df[, model_features, drop = FALSE]
+  
+  prob <- predict(
+    model,
+    newdata = x_test,
+    type = "prob"
+  )
+  
+  pred_class <- predict(
+    model,
+    newdata = x_test,
+    type = "raw"
+  )
+  
+  obs <- factor(
+    as.character(test_df$group),
+    levels = c("Tumor", "Normal")
+  )
+  
+  pred_class <- factor(
+    as.character(pred_class),
+    levels = c("Tumor", "Normal")
+  )
+  
+  roc_obj <- roc(
+    response = obs,
+    predictor = prob$Tumor,
+    levels = c("Normal", "Tumor"),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  auc_value <- as.numeric(auc(roc_obj))
+  
+  cm <- confusionMatrix(
+    data = pred_class,
+    reference = obs,
+    positive = "Tumor"
+  )
+  
+  performance <- data.frame(
+    Model = model_name,
+    AUC = auc_value,
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
+    stringsAsFactors = FALSE
+  )
+  
+  pred_df <- data.frame(
+    Sample = rownames(test_df),
+    Observed = obs,
+    Predicted = pred_class,
+    Prob_Tumor = prob$Tumor,
+    Prob_Normal = prob$Normal,
+    Model = model_name,
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(
+    performance = performance,
+    predictions = pred_df,
+    roc = roc_obj,
+    confusion_matrix = cm
+  ))
+}
+
+```
+
+Interpretation: these functions do not produce a biological result directly; they standardize inputs and enforce consistent processing.
+
+### Module 13: Test three models in TCGA balanced cohort
+
+This chunk applies the three trained machine-learning models to the balanced TCGA cohort.
+
+```{r b7-module-13-test-three-models-in-tcga-balanc}
+res_glmnet_balanced <- evaluate_one_model(
+  model = model_glmnet,
+  model_name = "Elastic-net",
+  test_df = test_df_balanced,
+  model_features = features_glmnet
+)
+
+res_rf_balanced <- evaluate_one_model(
+  model = model_rf,
+  model_name = "Random Forest",
+  test_df = test_df_balanced,
+  model_features = features_rf
+)
+
+res_svm_balanced <- evaluate_one_model(
+  model = model_svm,
+  model_name = "Radial SVM",
+  test_df = test_df_balanced,
+  model_features = features_svm
+)
+
+```
+
+Interpretation: the returned objects contain the sample-level predictions and performance metrics for the three trained classifiers.
+
+### Module 14: Combine and save performance results
+
+This chunk combines the performance and prediction results from the three classifiers and saves the corresponding evaluation outputs.
+
+```{r b7-module-14-combine-and-save-performance-res}
+performance_balanced <- rbind(
+  res_glmnet_balanced$performance,
+  res_rf_balanced$performance,
+  res_svm_balanced$performance
+)
+
+predictions_balanced <- rbind(
+  res_glmnet_balanced$predictions,
+  res_rf_balanced$predictions,
+  res_svm_balanced$predictions
+)
+
+cat("\nTCGA balanced model performance:\n")
+print(performance_balanced)
+
+fwrite(
+  performance_balanced,
+  file = file.path(outdir,"TCGA_balanced_model_performance.csv"
+))
+
+fwrite(
+  predictions_balanced,
+  file = file.path(outdir,"TCGA_balanced_model_predictions.csv"
+))
+
+capture.output(
+  res_glmnet_balanced$confusion_matrix,
+  file = file.path(outdir,"TCGA_balanced_confusion_matrix_elastic_net.txt"
+))
+
+capture.output(
+  res_rf_balanced$confusion_matrix,
+  file = file.path(outdir,"TCGA_balanced_confusion_matrix_random_forest.txt"
+))
+
+capture.output(
+  res_svm_balanced$confusion_matrix,
+  file = file.path(outdir,"TCGA_balanced_confusion_matrix_radial_svm.txt"
+))
+
+```
+
+Interpretation: higher ROC, sensitivity, and specificity indicate stronger discrimination, but external-cohort results remain the primary validation evidence.
+
+### Module 15: Plot ROC curves for three models
+
+This chunk prepares ROC coordinates and generates the ROC visualization for the three models.
+
+```{r b7-module-15-plot-roc-curves-for-three-models}
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.4f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+}
+
+roc_df_balanced <- rbind(
+  roc_to_df(
+    res_glmnet_balanced$roc,
+    "Elastic-net",
+    res_glmnet_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_rf_balanced$roc,
+    "Random Forest",
+    res_rf_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_svm_balanced$roc,
+    "Radial SVM",
+    res_svm_balanced$performance$AUC
+  )
+)
+```
+
+Interpretation: curves closer to the upper-left corner and larger AUC values indicate better separation of Tumor and Normal samples.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-15-plot-roc-curves-for-three-models-2}
+
+p_roc_balanced <- ggplot(
+  roc_df_balanced,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  coord_equal() +
+  labs(
+    title = "ROC curves in TCGA balanced cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = c(0.65, 0.20),
+    legend.background = element_rect(fill = "white", color = "black")
+  )
+
+p_roc_balanced
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_ROC_curves_3models.png"),
+  plot = p_roc_balanced,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-15-plot-roc-curves-for-three-models-4}
+
+p_roc_balanced <- ggplot(
+  roc_df_balanced,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_step(linewidth = 1.2, direction = "vh") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "ROC curves in TCGA balanced cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_roc_balanced
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_ROC_curves_3models_improved.png"),
+  plot = p_roc_balanced,
+  width = 8,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_ROC_curves_3models_improved.pdf"),
+  plot = p_roc_balanced,
+  width = 8,
+  height = 7
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-15-plot-roc-curves-for-three-models-5}
+
+############################################################
+## Zoomed ROC plot for TCGA balanced cohort
+############################################################
+
+## Rebuild ROC dataframe using 4 decimal places for AUC
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.4f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+  
+  df <- df[order(df$FPR, df$TPR), ]
+  
+  return(df)
+}
+
+roc_df_balanced <- rbind(
+  roc_to_df(
+    res_glmnet_balanced$roc,
+    "Elastic-net",
+    res_glmnet_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_rf_balanced$roc,
+    "Random Forest",
+    res_rf_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_svm_balanced$roc,
+    "Radial SVM",
+    res_svm_balanced$performance$AUC
+  )
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-15-plot-roc-curves-for-three-models-6}
+
+p_roc_balanced_zoom <- ggplot(
+  roc_df_balanced,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_step(linewidth = 1.2, direction = "vh") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  coord_cartesian(
+    xlim = c(0, 0.10),
+    ylim = c(0.90, 1.00)
+  ) +
+  labs(
+    title = "Zoomed ROC curves in TCGA balanced cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_roc_balanced_zoom
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_ROC_curves_3models_zoomed.png"),
+  plot = p_roc_balanced_zoom,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-15-plot-roc-curves-for-three-models-7}
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_ROC_curves_3models_zoomed.pdf"),
+  plot = p_roc_balanced_zoom,
+  width = 8,
+  height = 6
+)
+
+## Plot predicted Tumor probability distribution
+## More informative when ROC curves are near-perfect
+
+library(data.table)
+library(ggplot2)
+
+## If predictions_balanced is already in memory, use it directly.
+## Otherwise, load from saved file.
+if (!exists("predictions_balanced")) {
+  predictions_balanced <- fread(
+    file.path(
+      outdir,
+      "TCGA_balanced_model_predictions.csv"
+    ),
+    data.table = FALSE
+  )
+}
+
+predictions_balanced$Observed <- factor(
+  as.character(predictions_balanced$Observed),
+  levels = c("Normal", "Tumor")
+)
+
+predictions_balanced$Model <- factor(
+  predictions_balanced$Model,
+  levels = c("Elastic-net", "Random Forest", "Radial SVM")
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-15-plot-roc-curves-for-three-models-8}
+
+p_prob_balanced <- ggplot(
+  predictions_balanced,
+  aes(x = Observed, y = Prob_Tumor, color = Observed, fill = Observed)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.55,
+    alpha = 0.25
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.45,
+    size = 1.4
+  ) +
+  facet_wrap(~ Model, nrow = 1) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  labs(
+    title = "Predicted Tumor probability in TCGA balanced cohort",
+    x = "Observed group",
+    y = "Predicted probability of Tumor",
+    color = "Observed group",
+    fill = "Observed group"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    legend.position = "top"
+  )
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 15: Plot ROC curves for three models** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-15-plot-roc-curves-for-three-models-9}
+
+p_prob_balanced
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_predicted_Tumor_probability_distribution.png"),
+  plot = p_prob_balanced,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_predicted_Tumor_probability_distribution.pdf"),
+  plot = p_prob_balanced,
+  width = 10,
+  height = 5
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+### Module 16: Plot model performance barplot
+
+This chunk performs the operations described in **Module 16: Plot model performance barplot**.
+
+```{r b7-module-16-plot-model-performance-barplot}
+############################################################
+## Module 16. Plot model performance barplot
+## Fixed version using data.table::melt
+############################################################
+if(F){performance_long <- performance_balanced[, c(
+  "Model",
+  "AUC",
+  "Accuracy",
+  "Sensitivity",
+  "Specificity",
+  "Balanced_Accuracy"
+)]
+
+## Convert data.frame to data.table before melt
+performance_long <- as.data.table(performance_long)
+
+performance_long <- data.table::melt(
+  performance_long,
+  id.vars = "Model",
+  variable.name = "Metric",
+  value.name = "Value"
+)
+
+performance_long$Metric <- factor(
+  performance_long$Metric,
+  levels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced_Accuracy"),
+  labels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced accuracy")
+)
+
+p_perf_balanced <- ggplot(
+  performance_long,
+  aes(x = Model, y = Value, fill = Metric)
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    position = position_dodge(width = 0.8),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  coord_cartesian(ylim = c(0.95, 1.00), clip = "off") +
+  labs(
+    title = "Model performance in TCGA balanced cohort",
+    x = NULL,
+    y = "Performance",
+    fill = "Metric"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "top",
+    plot.margin = margin(10, 20, 10, 10)
+  )
+
+p_perf_balanced
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_model_performance_barplot.png"),
+  plot = p_perf_balanced,
+  width = 10,
+  height = 6,
+  dpi = 300
+)}
+```
+
+Interpretation: review the printed checks and generated objects before proceeding to the next analysis stage.
+
+This continuation of **Module 16: Plot model performance barplot** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-16-plot-model-performance-barplot-2}
+############################################################
+## Alternative: Heatmap-style performance plot
+## Recommended for very similar high-performance results
+############################################################
+
+library(data.table)
+library(ggplot2)
+
+performance_heat <- performance_balanced[, c(
+  "Model",
+  "AUC",
+  "Accuracy",
+  "Sensitivity",
+  "Specificity",
+  "Balanced_Accuracy"
+)]
+
+performance_heat <- as.data.table(performance_heat)
+
+performance_heat <- data.table::melt(
+  performance_heat,
+  id.vars = "Model",
+  variable.name = "Metric",
+  value.name = "Value"
+)
+
+performance_heat$Metric <- factor(
+  performance_heat$Metric,
+  levels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced_Accuracy"),
+  labels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced accuracy")
+)
+
+performance_heat$Model <- factor(
+  performance_heat$Model,
+  levels = c("Elastic-net", "Random Forest", "Radial SVM")
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 16: Plot model performance barplot** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-16-plot-model-performance-barplot-3}
+
+p_heat_balanced <- ggplot(
+  performance_heat,
+  aes(x = Metric, y = Model, fill = Value)
+) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    size = 5
+  ) +
+  scale_fill_gradient(
+    low = "#fdd0c4",
+    high = "#ff2610",
+    limits = c(0.95, 1.00)
+  ) +
+  labs(
+    title = "Model performance in TCGA balanced cohort",
+    x = NULL,
+    y = NULL,
+    fill = "Performance"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+p_heat_balanced
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_model_performance_heatmap.png"),
+  plot = p_heat_balanced,
+  width = 9,
+  height = 4.5,
+  dpi = 300
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+This continuation of **Module 16: Plot model performance barplot** completes the associated calculations while keeping the displayed code block compact.
+
+```{r b7-module-16-plot-model-performance-barplot-4}
+
+ggsave(
+  filename = file.path(outdir,"TCGA_balanced_model_performance_heatmap.pdf"),
+  plot = p_heat_balanced,
+  width = 9,
+  height = 4.5
+)
+```
+
+Interpretation: this continuation completes the same analysis step; interpret its outputs together with the preceding chunk.
+
+### Module 17: Save all balanced testing objects
+
+This chunk saves the principal analysis objects and result tables for reproducibility and downstream use.
+
+```{r b7-module-17-save-all-balanced-testing-object}
+############################################################
+## Module 17. Save all balanced testing objects
+############################################################
+
+save(
+  test_df_balanced,
+  performance_balanced,
+  predictions_balanced,
+  roc_df_balanced,
+  p_roc_balanced,
+  res_glmnet_balanced,
+  res_rf_balanced,
+  res_svm_balanced,
+  file = file.path(outdir,"TCGA_balanced_testing_results_3models.Rdata"
+))
+cat("\nFinal TCGA balanced model performance:\n")
+print(performance_balanced)
+
+
+```
+
+Interpretation: the printed file names or paths identify the reusable objects and result tables generated by this stage.
+
+# Session information
+
+The following command records the R version, platform, and package versions used to run the analysis.
+
+```{r session-information}
+sessionInfo()
+```
+
+Interpretation: this output provides the dependency information needed to reproduce the analysis environment.

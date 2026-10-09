@@ -1,0 +1,11 @@
+# Ignore everything
+*
+
+# Allow directories
+!*/
+
+# Keep gitignore
+!.gitignore
+
+# Keep all R markdown files
+!**/*.Rmd

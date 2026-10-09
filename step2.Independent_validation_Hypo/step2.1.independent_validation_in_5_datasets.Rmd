@@ -1,0 +1,931 @@
+---
+title: "step2.1.independent_validation_hypo_in_5_datasets"
+author: "YC"
+date: "`r Sys.Date()`"
+output:
+ html_document:
+  toc: true
+  toc_float: true
+  code_folding: hide
+  fig_width: 7
+  fig_height: 7
+  theme: cosmo
+---
+
+##🍁🍁step2.1.Independent validation of hypomethylated DMRs in five 450k datasets
+
+In this step, the discovery hypo-DMRs were tested in the five independent GEO datasets.
+The main validation workflow included:
+
+1. Loaded the discovery DMR table and the five preprocessed `myLoad` objects.
+2. Standardized the DMR coordinates and mapped 450K CpG probes to each DMR.
+3. Prepared and aligned each validation dataset.
+4. Calculated the Normal and Tumor mean beta values, delta beta values, p-values, and FDR values.
+5. Summarized the validation results across datasets.
+6. Saved the full validation results and exported robustly validated hypo-DMRs. DMRs validated in at least three independent datasets were retained for subsequent background filtering.
+
+#### Clear the environment and load the required packages 
+```{r validation_setup}
+
+rm(list = ls())
+options(timeout = 100000)
+options(scipen = 20)
+options(stringsAsFactors = FALSE)
+
+library(data.table)
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+```
+
+#### Set the input files and output directory
+```{r}
+## Discovery hypo-DMR file from DMRcate meta-analysis
+discovery_dmr_file <- "dmr_hypo_dmrcate_meta.csv"
+
+## Validation datasets
+## Each .Rdata file should contain an object named myLoad with myLoad$beta and myLoad$pd
+dataset_files <- c(
+  GSE54503  = "step0.1_GSE54503_output.Rdata",
+  GSE56588  = "step0.2_GSE56588_output.Rdata",
+  GSE77269  = "step0.3_GSE77269_output.Rdata",
+  GSE113017 = "step0.4_GSE113017_output.Rdata",
+  GSE136319 = "step0.5_GSE136319_output.Rdata")
+
+## Output directory
+outdir <- "independent_validation_hypo_5datasets"
+
+if (!dir.exists(outdir)) {dir.create(outdir)}
+```
+All validation inputs and outputs were assigned fixed file paths.
+
+####❤️ Set the validation criteria
+`min_cpg_required <- 5` means that at least 6 CpGs are required, consistent with the discovery criterion of `no.cpgs >= 6`.
+`deltaBeta_validation` was calculated as Tumor minus Normal.
+The primary validation criterion for hypo-DMRs was defined as `deltaBeta_validation < -0.22` with nominal `p < 0.05`.
+An additional `FDR < 0.05` criterion was calculated as a more stringent sensitivity analysis.
+
+```{r}
+min_cpg_required <- 5
+delta_cutoff <- 0.22
+p_cutoff <- 0.05
+fdr_cutoff <- 0.05
+```
+#### Load discovery DMRs from CSV
+```{r}
+dmr_obj <- read.csv(discovery_dmr_file,
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE)
+
+print(discovery_dmr_file)
+dim(dmr_obj)
+#View(dmr_obj)
+```
+
+#### Define a function to identify column names
+This helper function finds the first available column that matches a list of possible names.
+```{r}
+match_col <- function(df, candidates) {
+  
+  idx <- match(tolower(candidates), tolower(colnames(df)))
+  idx <- idx[!is.na(idx)]
+  
+  if (length(idx) == 0) {
+    return(NA_character_)
+  } else {
+    return(colnames(df)[idx[1]])
+  }
+}
+```
+`match_col()` was created for DMR-table standardization.
+
+#### Define a function to identify the CpG column
+This helper function searches the DMR table for a column containing Illumina CpG probe IDs.
+```{r}
+find_cpg_col <- function(df) {
+  
+  candidate_cols <- colnames(df)[
+    grepl("cpg|probe|probes|name|id", colnames(df), ignore.case = TRUE)
+  ]
+  
+  if (length(candidate_cols) == 0) {
+    return(NA_character_)
+  }
+  
+  for (cn in candidate_cols) {
+    
+    vals <- as.character(df[[cn]])
+    vals <- vals[!is.na(vals)]
+    vals <- vals[seq_len(min(length(vals), 100))]
+    
+    if (any(grepl("cg[0-9]{8}", vals))) {
+      return(cn)
+    }
+  }
+  
+  return(NA_character_)
+}
+```
+`find_cpg_col()` returns the CpG column name when one is available.
+
+#### Define a function to identify the coordinate column
+This helper function searches for genomic coordinates written in `chr:start-end` format.
+```{r}
+find_coord_col <- function(df) {
+  
+  candidate_cols <- colnames(df)[
+    grepl("coord|region|position|location|dmr", colnames(df), ignore.case = TRUE)
+  ]
+  
+  if (length(candidate_cols) == 0) {
+    candidate_cols <- colnames(df)
+  }
+  
+  for (cn in candidate_cols) {
+    
+    vals <- as.character(df[[cn]])
+    vals <- vals[!is.na(vals)]
+    vals <- vals[seq_len(min(length(vals), 100))]
+    
+    if (any(grepl("^chr[^:]+:[0-9,]+-[0-9,]+$", vals))) {
+      return(cn)
+    }
+  }
+  
+  return(NA_character_)
+}
+```
+`find_coord_col()` was created for coordinate detection.
+
+#### Define a function to standardize chromosome names
+This function converts chromosome labels to a consistent `chr` format.
+```{r}
+standardize_chr <- function(x) {
+  
+  x <- as.character(x)
+  x <- gsub("^CHR", "chr", x, ignore.case = TRUE)
+  x <- ifelse(grepl("^chr", x, ignore.case = TRUE), x, paste0("chr", x))
+  
+  return(x)
+}
+```
+Chromosome names were standardized for annotation matching.
+
+#### Define a function to parse genomic coordinates
+This function separates a genomic coordinate into chromosome, start, and end values.
+```{r}
+parse_coord <- function(coord) {
+  
+  coord <- as.character(coord)
+  coord <- gsub(",", "", coord)
+  
+  ok <- grepl("^chr[^:]+:[0-9]+-[0-9]+$", coord)
+  
+  chr <- rep(NA_character_, length(coord))
+  start <- rep(NA_integer_, length(coord))
+  end <- rep(NA_integer_, length(coord))
+  
+  chr[ok] <- sub(":.*", "", coord[ok])
+  start[ok] <- as.integer(sub(".*:([0-9]+)-[0-9]+$", "\\1", coord[ok]))
+  end[ok] <- as.integer(sub(".*:[0-9]+-([0-9]+)$", "\\1", coord[ok]))
+  
+  out <- data.frame(
+    chr = standardize_chr(chr),
+    start = start,
+    end = end,
+    stringsAsFactors = FALSE
+  )
+  
+  return(out)
+}
+```
+`parse_coord()` was created for coordinate conversion.
+
+#### Define a function to standardize the DMR table
+This function identifies the DMR coordinates and CpG information and creates a standard DMR table.
+```{r}
+standardize_dmr_table <- function(dmr_obj) {
+  
+  dmr.df <- as.data.frame(dmr_obj)
+  
+  chr_col <- match_col(
+    dmr.df,
+    c("chr", "chrom", "chromosome", "seqnames")
+  )
+  
+  start_col <- match_col(
+    dmr.df,
+    c("start", "start_position", "pos_start", "dmr_start")
+  )
+  
+  end_col <- match_col(
+    dmr.df,
+    c("end", "end_position", "pos_end", "dmr_end")
+  )
+  
+  coord_col <- find_coord_col(dmr.df)
+  cpg_col <- find_cpg_col(dmr.df)
+  
+  rowname_coord <- NULL
+  
+  if (!is.null(rownames(dmr.df))) {
+    rn <- rownames(dmr.df)
+    
+    if (any(grepl("^chr[^:]+:[0-9,]+-[0-9,]+$", rn))) {
+      rowname_coord <- parse_coord(rn)
+    }
+  }
+  
+  coord_parsed <- NULL
+  
+  if (!is.na(coord_col)) {
+    coord_vals <- as.character(dmr.df[[coord_col]])
+    
+    if (any(grepl("^chr[^:]+:[0-9,]+-[0-9,]+$", coord_vals))) {
+      coord_parsed <- parse_coord(coord_vals)
+    }
+  }
+  
+  ## chr
+  if (!is.na(chr_col)) {
+    chr_out <- standardize_chr(dmr.df[[chr_col]])
+  } else if (!is.null(coord_parsed)) {
+    chr_out <- coord_parsed$chr
+  } else if (!is.null(rowname_coord)) {
+    chr_out <- rowname_coord$chr
+  } else {
+    chr_out <- rep(NA_character_, nrow(dmr.df))
+  }
+  
+  ## start
+  if (!is.na(start_col)) {
+    start_out <- as.integer(gsub(",", "", dmr.df[[start_col]]))
+  } else if (!is.null(coord_parsed)) {
+    start_out <- coord_parsed$start
+  } else if (!is.null(rowname_coord)) {
+    start_out <- rowname_coord$start
+  } else {
+    start_out <- rep(NA_integer_, nrow(dmr.df))
+  }
+  
+  ## end
+  if (!is.na(end_col)) {
+    end_out <- as.integer(gsub(",", "", dmr.df[[end_col]]))
+  } else if (!is.null(coord_parsed)) {
+    end_out <- coord_parsed$end
+  } else if (!is.null(rowname_coord)) {
+    end_out <- rowname_coord$end
+  } else {
+    end_out <- rep(NA_integer_, nrow(dmr.df))
+  }
+  
+  ## DMR ID
+  if (!all(is.na(chr_out)) && !all(is.na(start_out)) && !all(is.na(end_out))) {
+    dmr_id <- paste0(chr_out, ":", start_out, "-", end_out)
+  } else if (!is.na(coord_col)) {
+    dmr_id <- as.character(dmr.df[[coord_col]])
+  } else if (!is.null(rownames(dmr.df)) &&
+             !all(rownames(dmr.df) == as.character(seq_len(nrow(dmr.df))))) {
+    dmr_id <- rownames(dmr.df)
+  } else {
+    dmr_id <- paste0("DMR_", seq_len(nrow(dmr.df)))
+  }
+  
+  dmr_id <- make.unique(as.character(dmr_id))
+  
+  out <- data.frame(
+    DMR_id = dmr_id,
+    chr = chr_out,
+    start = start_out,
+    end = end_out,
+    cpg_string = if (!is.na(cpg_col)) as.character(dmr.df[[cpg_col]]) else NA_character_,
+    stringsAsFactors = FALSE
+  )
+  
+  if (all(is.na(out$chr)) && all(is.na(out$cpg_string))) {
+    stop("No chromosome coordinates or CpG probe IDs were found in the discovery DMR table.")
+  }
+  
+  return(out)
+}
+```
+`standardize_dmr_table()` was created to support different possible discovery-table formats.
+
+#### Standardize the discovery DMR table
+The discovery DMR table was converted to standard DMR ID, chromosome, start, end, and CpG-string columns.
+```{r}
+dmr.tbl <- standardize_dmr_table(dmr_obj)
+dim(dmr.tbl)
+colSums(is.na(dmr.tbl[, c("chr", "start", "end")]))
+```
+
+#### Load the Illumina 450K annotation
+The hg19 Illumina 450K annotation was loaded and converted into a CpG-coordinate table.
+```{r}
+anno <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+anno.df <- data.frame(
+  CpG = rownames(anno),
+  chr = standardize_chr(anno$chr),
+  pos = as.integer(anno$pos),
+  stringsAsFactors = FALSE
+)
+
+anno.dt <- as.data.table(anno.df)
+```
+The annotation table was prepared for mapping CpGs to DMRs.
+
+#### Define a function to map CpGs to each DMR
+This function first uses CpG IDs stored in the DMR table and otherwise maps probes using chromosome coordinates.
+```{r}
+build_dmr_cpg_list <- function(dmr.tbl, anno.dt) {
+  
+  cpg.list <- vector("list", nrow(dmr.tbl))
+  names(cpg.list) <- dmr.tbl$DMR_id
+  
+  for (i in seq_len(nrow(dmr.tbl))) {
+    
+    cpgs <- character(0)
+    
+    ## First, try to extract CpG IDs directly from the discovery DMR table
+    if (!is.na(dmr.tbl$cpg_string[i]) &&
+        grepl("cg[0-9]{8}", dmr.tbl$cpg_string[i])) {
+      
+      cpgs <- unique(unlist(regmatches(
+        dmr.tbl$cpg_string[i],
+        gregexpr("cg[0-9]{8}", dmr.tbl$cpg_string[i])
+      )))
+    }
+    
+    ## If no CpG IDs are available, map CpGs by chromosome coordinates
+    if (length(cpgs) == 0 &&
+        !is.na(dmr.tbl$chr[i]) &&
+        !is.na(dmr.tbl$start[i]) &&
+        !is.na(dmr.tbl$end[i])) {
+      
+      chr_i <- dmr.tbl$chr[i]
+      start_i <- dmr.tbl$start[i]
+      end_i <- dmr.tbl$end[i]
+      
+      cpgs <- anno.dt[
+        chr == chr_i & pos >= start_i & pos <= end_i,
+        CpG
+      ]
+    }
+    
+    cpg.list[[i]] <- unique(cpgs)
+  }
+  
+  return(cpg.list)
+}
+```
+`build_dmr_cpg_list()` was created for probe mapping.
+
+#### Map 450K CpGs to the discovery DMRs
+The CpG list was generated for every DMR, and the number of mapped probes was counted.
+```{r}
+dmr.cpg.list <- build_dmr_cpg_list(dmr.tbl, anno.dt)
+
+dmr.tbl$nCpG_450K_annotation <- lengths(dmr.cpg.list)
+
+summary(dmr.tbl$nCpG_450K_annotation)
+
+sum(dmr.tbl$nCpG_450K_annotation == 0)
+```
+DMRs with no mapped 450K probes cannot be tested in the validation datasets.
+
+#### Define a function to load each validation dataset
+
+This function loads an `.Rdata` file and extracts `myLoad$beta` and `myLoad$pd`.
+```{r define_load_validation_dataset}
+
+load_validation_dataset <- function(file) {
+  
+  env <- new.env()
+  loaded_objects <- load(file, envir = env)
+  
+  if (!"myLoad" %in% loaded_objects) {
+    stop(paste0(
+      "Object 'myLoad' was not found in file: ",
+      file,
+      ". Objects found: ",
+      paste(loaded_objects, collapse = ", ")
+    ))
+  }
+  
+  obj <- get("myLoad", envir = env)
+  
+  if (!is.list(obj)) {
+    stop(paste0("myLoad is not a list in file: ", file))
+  }
+  
+  if (!"beta" %in% names(obj)) {
+    stop(paste0("Cannot find myLoad$beta in file: ", file))
+  }
+  
+  if (!"pd" %in% names(obj)) {
+    stop(paste0("Cannot find myLoad$pd in file: ", file))
+  }
+  
+  beta <- obj$beta
+  pd <- obj$pd
+  
+  beta <- as.matrix(beta)
+  mode(beta) <- "numeric"
+  
+  pd <- as.data.frame(pd)
+  
+  return(list(beta = beta, pd = pd))
+}
+```
+`load_validation_dataset()` checks that the expected objects are available.
+
+#### Define a function to standardize sample groups
+
+This function converts different phenotype descriptions to the standard labels Normal and Tumor.
+```{r}
+normalize_group <- function(group_vector) {
+  
+  x <- as.character(group_vector)
+  out <- rep(NA_character_, length(x))
+  
+  out[grepl("tumor|tumour|cancer|carcinoma|hcc", x, ignore.case = TRUE)] <- "Tumor"
+  out[grepl("normal|control|adjacent|mucosa|healthy", x, ignore.case = TRUE)] <- "Normal"
+  
+  return(factor(out, levels = c("Normal", "Tumor")))
+}
+```
+`normalize_group()` ensures consistent group labels across datasets.
+
+#### Define a function to prepare each validation dataset
+
+This function aligns the phenotype table and beta matrix, identifies the group column, retains Normal and Tumor samples, and checks the sample numbers.
+```{r}
+prepare_validation_dataset <- function(dataset_name, file) {
+  
+  dat <- load_validation_dataset(file)
+  
+  beta <- dat$beta
+  pd <- dat$pd
+  
+  ## Set row names of phenotype table using ID column if possible
+  if ("ID" %in% colnames(pd) && setequal(as.character(pd$ID), colnames(beta))) {
+    rownames(pd) <- as.character(pd$ID)}
+  
+  ## If sample names are the same but order is different, reorder phenotype table
+  if (setequal(rownames(pd), colnames(beta))) {pd <- pd[colnames(beta), , drop = FALSE]}
+  
+  ## Stop if beta matrix and phenotype table cannot be aligned
+  if (!identical(rownames(pd), colnames(beta))) {
+    stop(paste0("Sample alignment failed in ",
+      dataset_name,". Please check rownames(pd), pd$ID, and colnames(beta)."))}
+  
+  ## Find group column
+  group_col <- NA_character_
+  
+  for (cn in c("group", "Group", "condition", "Condition", "phenotype", "Phenotype")) {
+    if (cn %in% colnames(pd)) {
+      group_col <- cn
+      break}}
+  
+  if (is.na(group_col)) {
+    stop(paste0("No group column was found in phenotype table of ", dataset_name))}
+  
+  ## Use the standardized group labels generated during dataset preprocessing
+pd$group <- factor(
+  as.character(pd[[group_col]]),
+  levels = c("Normal", "Tumor")
+)
+  
+  ## Keep only Normal and Tumor samples
+  keep <- !is.na(pd$group) & pd$group %in% c("Normal", "Tumor")
+  
+  beta <- beta[, keep, drop = FALSE]
+  pd <- pd[keep, , drop = FALSE]
+  
+  ## Set clean ID column
+  pd$ID <- rownames(pd)
+  
+  ## Check sample size
+  if (sum(pd$group == "Normal") < 2 || sum(pd$group == "Tumor") < 2) {
+    stop(paste0("Too few samples after filtering in ",
+      dataset_name,
+      ". Need at least 2 Normal and 2 Tumor samples."))}
+  
+  ## Sort samples by group
+  sample_order <- order(pd$group)
+  pd <- pd[sample_order, , drop = FALSE]
+  beta <- beta[, rownames(pd), drop = FALSE]
+  
+  ## Final strict check
+  stopifnot(identical(rownames(pd), colnames(beta)))
+  
+  cat("\nDataset:", dataset_name, "\n")
+  cat("beta dimension:\n")
+  print(dim(beta))
+  cat("group distribution:\n")
+  print(table(pd$group, useNA = "ifany"))
+  cat("alignment check:\n")
+  print(identical(rownames(pd), colnames(beta)))
+  
+  return(list(beta = beta, pd = pd))
+}
+```
+`prepare_validation_dataset()` returns an aligned beta matrix and phenotype table.
+
+#### Define the DMR validation function
+
+For each DMR, this function calculates the mean Normal and Tumor beta values, delta beta, t-test p-value, FDR, and validation status.
+```{r}
+validate_one_dataset <- function(dataset_name, file, dmr.tbl, dmr.cpg.list) {
+  
+  dat <- prepare_validation_dataset(dataset_name, file)
+  
+  beta <- dat$beta
+  pd <- dat$pd
+  
+  normal_samples <- rownames(pd)[pd$group == "Normal"]
+  tumor_samples <- rownames(pd)[pd$group == "Tumor"]
+  
+  res.list <- vector("list", nrow(dmr.tbl))
+  
+  for (i in seq_len(nrow(dmr.tbl))) {
+    
+    dmr_id <- dmr.tbl$DMR_id[i]
+    
+    ## Use list index instead of DMR_id name to avoid duplicated-name problems
+    cpgs_all <- dmr.cpg.list[[i]]
+    cpgs_present <- intersect(cpgs_all, rownames(beta))
+    
+    nCpG <- length(cpgs_present)
+    
+    if (nCpG <= min_cpg_required) {
+      
+      res.list[[i]] <- data.frame(
+        dataset = dataset_name,
+        DMR_id = dmr_id,
+        chr = dmr.tbl$chr[i],
+        start = dmr.tbl$start[i],
+        end = dmr.tbl$end[i],
+        nCpG = nCpG,
+        mean_Normal = NA_real_,
+        mean_Tumor = NA_real_,
+        deltaBeta_validation = NA_real_,
+        p.value = NA_real_,
+        stringsAsFactors = FALSE
+      )
+      
+      next
+    }
+    
+    ## Calculate mean beta value of this DMR for each sample
+    dmr_beta <- colMeans(beta[cpgs_present, , drop = FALSE], na.rm = TRUE)
+    dmr_beta[is.nan(dmr_beta)] <- NA_real_
+    
+    normal_values <- dmr_beta[normal_samples]
+    tumor_values <- dmr_beta[tumor_samples]
+    
+    mean_normal <- mean(normal_values, na.rm = TRUE)
+    mean_tumor <- mean(tumor_values, na.rm = TRUE)
+    
+    delta_beta <- mean_tumor - mean_normal
+    
+    pval <- tryCatch(
+      t.test(tumor_values, normal_values)$p.value,
+      error = function(e) NA_real_
+    )
+    
+    res.list[[i]] <- data.frame(
+      dataset = dataset_name,
+      DMR_id = dmr_id,
+      chr = dmr.tbl$chr[i],
+      start = dmr.tbl$start[i],
+      end = dmr.tbl$end[i],
+      nCpG = nCpG,
+      mean_Normal = mean_normal,
+      mean_Tumor = mean_tumor,
+      deltaBeta_validation = delta_beta,
+      p.value = pval,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  res <- rbindlist(res.list, fill = TRUE)
+  
+  ## Adjust p values within each validation dataset
+  res$FDR <- p.adjust(res$p.value, method = "BH")
+  
+  ## Main validation criterion for discovery hypo-DMRs
+res$validated_p005 <- with(
+  res,
+  nCpG > min_cpg_required &
+    deltaBeta_validation < -delta_cutoff &
+    p.value < p_cutoff
+)
+  
+  ## More stringent FDR-based criterion
+res$validated_FDR005 <- with(
+  res,
+  nCpG > min_cpg_required &
+    deltaBeta_validation < -delta_cutoff &
+    FDR < fdr_cutoff
+)
+  
+  return(res)
+}
+```
+`validate_one_dataset()` returns one validation result for every DMR in a dataset.
+
+#### Run validation across all five datasets
+
+The DMR validation function was applied to each GEO dataset, and all results were combined.
+```{r}
+all.validation.list <- list()
+
+for (dataset_name in names(dataset_files)) {
+  
+  cat("\n============================================================\n")
+  cat("Running validation for:", dataset_name, "\n")
+  cat("============================================================\n")
+  
+  all.validation.list[[dataset_name]] <- validate_one_dataset(
+    dataset_name = dataset_name,
+    file = dataset_files[[dataset_name]],
+    dmr.tbl = dmr.tbl,
+    dmr.cpg.list = dmr.cpg.list
+  )
+}
+
+all.validation <- rbindlist(all.validation.list, fill = TRUE)
+
+cat("\nAll validation result dimension:\n")
+print(dim(all.validation))
+print(head(all.validation))
+```
+The combined table contains one result for each DMR-dataset combination.
+
+#### Define safe summary functions
+
+These functions calculate the mean, maximum, and minimum while safely handling missing values.
+
+```{r}
+## Summarize validation results across datasets
+safe_mean <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  return(mean(x))
+}
+
+safe_max <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  return(max(x))
+}
+
+safe_min <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  return(min(x))
+}
+```
+This function summarizes each DMR across datasets and combines the available dataset-specific p-values using Fisher's method to provide an overall cross-dataset significance measure.
+
+#### Define the cross-dataset DMR summary function
+
+This function summarizes each DMR across datasets and combines its p-values using Fisher's method.
+```{r}
+summarize_one_dmr <- function(df) {
+  
+  pvals <- df$p.value
+  pvals <- pvals[!is.na(pvals)]
+  
+  fisher_p <- NA_real_
+  
+  if (length(pvals) > 0) {
+    pvals <- pmax(pvals, .Machine$double.xmin)
+    fisher_p <- pchisq(
+      -2 * sum(log(pvals)),
+      df = 2 * length(pvals),
+      lower.tail = FALSE
+    )
+  }
+  
+  data.frame(
+    DMR_id = df$DMR_id[1],
+    chr = df$chr[1],
+    start = df$start[1],
+    end = df$end[1],
+    tested_datasets = sum(!is.na(df$p.value)),
+    validated_datasets_p005 = sum(df$validated_p005, na.rm = TRUE),
+    validated_datasets_FDR005 = sum(df$validated_FDR005, na.rm = TRUE),
+    mean_deltaBeta = safe_mean(df$deltaBeta_validation),
+    max_deltaBeta = safe_max(df$deltaBeta_validation),
+    min_p.value = safe_min(pvals),
+    fisher_p.value = fisher_p,
+    stringsAsFactors = FALSE
+  )
+}
+```
+`summarize_one_dmr()` produces one cross-dataset summary row per DMR.
+
+#### Summarize and rank all DMRs
+
+All DMR results were summarized across the five datasets, adjusted for multiple testing, and ranked by validation strength.
+```{r}
+summary.list <- lapply(
+  split(all.validation, all.validation$DMR_id),
+  summarize_one_dmr
+)
+
+validation.summary <- rbindlist(summary.list, fill = TRUE)
+
+validation.summary$meta_FDR <- p.adjust(
+  validation.summary$fisher_p.value,
+  method = "BH"
+)
+
+validation.summary$validated_any_p005 <- validation.summary$validated_datasets_p005 >= 1
+validation.summary$validated_at_least2_p005 <- validation.summary$validated_datasets_p005 >= 2
+validation.summary$validated_any_FDR005 <- validation.summary$validated_datasets_FDR005 >= 1
+
+## Sort DMRs by validation strength
+validation.summary <- validation.summary[
+  order(
+    -validated_datasets_p005,
+    mean_deltaBeta,
+    min_p.value
+  ),
+]
+
+cat("\nValidation summary dimension:\n")
+print(dim(validation.summary))
+print(head(validation.summary))
+```
+The leading rows represent the strongest independently validated hypo-DMRs.
+
+#### Save the main validation results
+
+The complete validation table, cross-dataset summary, and p-value-based DMR subsets were saved.
+```{r}
+## Save all per-dataset results
+fwrite(all.validation,
+  file = file.path(outdir, "validation_results_all_DMRs_all_5datasets.csv")
+)
+
+## Save summary results across all validation datasets
+fwrite(validation.summary,
+  file = file.path(outdir, "validation_summary_across_5datasets.csv"))
+
+## Save DMRs validated in at least one dataset using p < 0.05 criterion
+validated_p005 <- validation.summary[
+  validation.summary$validated_any_p005 == TRUE,]
+
+fwrite(validated_p005,
+  file = file.path(outdir, "validated_hypo_DMRs_at_least_one_dataset_p005.csv"))
+
+## Save DMRs validated in at least two datasets using p < 0.05 criterion
+validated_at_least2_p005 <- validation.summary[
+  validation.summary$validated_at_least2_p005 == TRUE,]
+
+fwrite(validated_at_least2_p005,
+  file = file.path(outdir, "validated_hypo_DMRs_at_least_two_datasets_p005.csv"))
+```
+These CSV files contain the main validation results.
+
+#### Save the FDR and dataset-specific results
+
+The FDR-based DMR subset and separate result files for each dataset were saved.
+```{r}
+## Save DMRs validated in at least one dataset using FDR < 0.05 criterion
+validated_FDR005 <- validation.summary[
+  validation.summary$validated_any_FDR005 == TRUE,]
+
+fwrite(validated_FDR005,
+  file = file.path(outdir, "validated_hypo_DMRs_at_least_one_dataset_FDR005.csv"))
+
+## Save per-dataset results separately
+for (dataset_name in names(dataset_files)) {
+  
+  tmp <- all.validation[all.validation$dataset == dataset_name, ]
+  
+  fwrite(tmp,
+    file = file.path(
+      outdir,
+      paste0(dataset_name, "_validation_results_all_DMRs.csv")))}
+```
+
+These files support stricter filtering and dataset-level checking.
+
+#### Create the dataset-level summary and bar plot
+
+The number of tested and validated DMRs was summarized for each dataset, and a bar plot was saved.
+```{r}
+dataset.summary <- rbindlist(lapply(
+  split(all.validation, all.validation$dataset),
+  function(df) {
+    data.frame(
+      dataset = df$dataset[1],
+      tested_DMRs = sum(!is.na(df$p.value)),
+      validated_p005 = sum(df$validated_p005, na.rm = TRUE),
+      validated_FDR005 = sum(df$validated_FDR005, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  }
+))
+
+fwrite(
+  dataset.summary,
+  file = file.path(outdir, "validation_summary_by_dataset.csv")
+)
+
+png(
+  filename = file.path(outdir, "validation_summary_barplot.png"),
+  width = 1600,
+  height = 900,
+  res = 150
+)
+
+barplot(
+  dataset.summary$validated_p005,
+  names.arg = dataset.summary$dataset,
+  las = 2,
+  ylab  = "Number of validated hypo-DMRs",,
+  main = "Independent validation of discovery hypo-DMRs"
+)
+
+dev.off()
+
+cat("\nDataset-level validation summary:\n")
+print(dataset.summary)
+```
+The table and plot show the validation performance of the five datasets.
+
+#### Export robustly validated hypo-DMRs
+
+DMRs validated in at least three, at least four, or all five datasets were selected and saved.
+```{r}
+robust_validated_DMRs <- validation.summary[
+  validation.summary$validated_datasets_p005 >= 3,
+]
+
+high_confidence_DMRs <- validation.summary[
+  validation.summary$validated_datasets_p005 >= 4,
+]
+
+all5_validated_DMRs <- validation.summary[
+  validation.summary$validated_datasets_p005 == 5,
+]
+
+cat("\nRobust validation results:\n")
+cat("Validated in at least 3 datasets:\n")
+print(dim(robust_validated_DMRs))
+
+cat("Validated in at least 4 datasets:\n")
+print(dim(high_confidence_DMRs))
+
+cat("Validated in all 5 datasets:\n")
+print(dim(all5_validated_DMRs))
+
+fwrite(
+  robust_validated_DMRs,
+  file = file.path(outdir, "robust_validated_hypo_DMRs_at_least_3datasets.csv")
+)
+
+fwrite(
+  high_confidence_DMRs,
+  file = file.path(outdir, "high_confidence_hypo_DMRs_at_least_4datasets.csv")
+)
+
+fwrite(
+  all5_validated_DMRs,
+  file = file.path(outdir, "hypo_DMRs_validated_in_all_5datasets.csv")
+)
+```
+#### Inspect the final output files
+
+The main output directory and important result files were printed for final checking.
+```{r}
+############################################################
+## Step 14. Final objects to inspect
+############################################################
+
+cat("\nFinished independent validation.\n")
+cat("Main output directory:\n")
+print(outdir)
+
+cat("\nMain files to check:\n")
+print(file.path(outdir, "validation_summary_across_5datasets.csv"))
+print(file.path(outdir, "validation_summary_by_dataset.csv"))
+print(file.path(outdir, "robust_validated_hypo_DMRs_at_least_3datasets.csv"))
+print(file.path(outdir, "high_confidence_hypo_DMRs_at_least_4datasets.csv"))
+
+print(head(validation.summary))
+dataset.summary
+
+```
+
+## session information
+```{r}
+sessionInfo()
+```
+
